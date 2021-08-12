@@ -2,6 +2,11 @@
 
 A Python library for differentiable optimal control on accelerators.
 
+Jump to: [**installation**](#installation)
+| [**background**](#trajectory-optimization-and-optimal-control)
+| [**API**](#api)
+| [**limitations**](#limitations)
+
 Trajax builds on [JAX](https://github.com/google/jax) and hence code written
 with Trajax supports JAX's transformations. In particular, Trajax's solvers:
 
@@ -15,6 +20,20 @@ In Trajax, differentiation through the solution of a trajectory optimization pro
 **This is a research project, not an official Google product.**
 
 Trajax is currently a work in progress, maintained by a few individuals at Google Research. While we are actively using Trajax in our own research projects, expect there to be bugs and rough edges compared to commercially available solvers.
+
+## Installation
+
+To install directly from github using `pip`:
+
+```bash
+$ pip install git+https://github.com/google/trajax
+```
+
+Alternatively, to install from source:
+
+```bash
+$ python setup.py install
+```
 
 ## Trajectory optimization and optimal control
 

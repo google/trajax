@@ -50,7 +50,6 @@ from __future__ import print_function
 
 from functools import partial  # pylint: disable=g-importing-member
 
-from immutabledict import immutabledict
 import jax
 from jax import custom_derivatives
 from jax import device_get
@@ -683,13 +682,14 @@ def scipy_minimize(cost,
 
 # Sampling based Zeroth Order Optimization via Cross-Entropy Method
 
-DEFAULT_CEM_HYPERPARAMS = immutabledict({
-    'sampling_smoothing': 0.,
-    'evolution_smoothing': 0.1,
-    'elite_portion': 0.1,
-    'max_iter': 10,
-    'num_samples': 400
-})
+def default_cem_hyperparams():
+  return {
+      'sampling_smoothing': 0.,
+      'evolution_smoothing': 0.1,
+      'elite_portion': 0.1,
+      'max_iter': 10,
+      'num_samples': 400
+  }
 
 
 @partial(jit, static_argnums=(4,))
@@ -791,7 +791,7 @@ def cem(cost,
   if random_key is None:
     random_key = random.PRNGKey(0)
   if hyperparams is None:
-    hyperparams = DEFAULT_CEM_HYPERPARAMS
+    hyperparams = default_cem_hyperparams()
   mean = np.array(init_controls)
   stdev = np.array([(control_high - control_low) / 2.] * init_controls.shape[0])
   obj_fn = partial(objective, cost, dynamics)
@@ -853,7 +853,7 @@ def random_shooting(cost,
   if random_key is None:
     random_key = random.PRNGKey(0)
   if hyperparams is None:
-    hyperparams = DEFAULT_CEM_HYPERPARAMS
+    hyperparams = default_cem_hyperparams()
   mean = np.array(init_controls)
   stdev = np.array([(control_high - control_low) / 2.] * init_controls.shape[0])
   obj_fn = partial(_objective, cost, dynamics)
