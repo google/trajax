@@ -66,14 +66,14 @@ def lqr_step(P, p, Q, q, R, r, M, A, B, c, delta=1e-8):
   Args:
     P: [n, n] numpy array.
     p: [n] numpy array.
-    Q: [T+1, n, n] numpy array.
-    q: [T+1, n] numpy array.
-    R: [T, m, m] numpy array.
-    r: [T, m] numpy array.
-    M: [T, n, m] numpy array.
-    A: [T, n, n] numpy array.
-    B: [T, n, m] numpy array.
-    c: [T, n] numpy array.
+    Q: [n, n] numpy array.
+    q: [n] numpy array.
+    R: [m, m] numpy array.
+    r: [m] numpy array.
+    M: [n, m] numpy array.
+    A: [n, n] numpy array.
+    B: [n, m] numpy array.
+    c: [n] numpy array.
     delta: Enforces positive definiteness by ensuring smallest eigenval > delta.
 
   Returns:
