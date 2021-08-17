@@ -419,6 +419,7 @@ def ilqr(cost,
          maxiter=100,
          grad_norm_threshold=1e-4,
          make_psd=False,
+         psd_delta=0.0,
          alpha_0=1.0,
          alpha_min=0.00005):
   """Iterative Linear Quadratic Regulator.
@@ -431,6 +432,9 @@ def ilqr(cost,
     maxiter: maximum iterations.
     grad_norm_threshold: tolerance for stopping optimization.
     make_psd: whether to zero negative eigenvalues after quadratization.
+    psd_delta: The delta value to make the problem PSD. Specifically, it will
+      ensure that d^2c/dx^2 and d^2c/du^2, i.e. the hessian of cost function
+      with respect to state and control are always positive definite.
     alpha_0: initial line search value.
     alpha_min: minimum line search value.
 
@@ -448,13 +452,13 @@ def ilqr(cost,
       dynamics, x0, U[0], 0)
   return _ilqr(cost_fn, dynamics_fn, x0, U, tuple(cost_args),
                tuple(dynamics_args), maxiter, grad_norm_threshold, make_psd,
-               alpha_0, alpha_min)
+               psd_delta, alpha_0, alpha_min)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
 @partial(jit, static_argnums=(0, 1))
 def _ilqr(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
-          grad_norm_threshold, make_psd, alpha_0, alpha_min):
+          grad_norm_threshold, make_psd, psd_delta, alpha_0, alpha_min):
   """ilqr implementation."""
 
   T, m = U.shape
@@ -465,7 +469,7 @@ def _ilqr(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
   dynamics_jacobians = linearize(dynamics)
   cost_gradients = linearize(cost)
   evaluator = partial(evaluate, cost)
-  psd = vmap(project_psd_cone)
+  psd = vmap(partial(project_psd_cone, delta=psd_delta))
 
   X = roll(U, x0, *dynamics_args)
   timesteps = np.arange(X.shape[0])
