@@ -435,6 +435,164 @@ class OptimizersTest(parameterized.TestCase):
     self.assertEqual(updated_stdev.all(),
                      np.zeros((horizon, dim_control)).all())
 
+  def testConstrainedAcrobotSolve(self):
+    T = 50
+    goal = np.array([np.pi, 0.0, 0.0, 0.0])
+    u_lower = -5.0  # control limits
+    u_upper = 5.0  # control limits
+    dynamics = euler(acrobot, dt=0.1)
+
+    def cost(x, u, t, params):
+      delta = x - goal
+      terminal_cost = 0.5 * params[0] * np.dot(delta, delta)
+      stagewise_cost = 0.5 * params[1] * np.dot(
+          delta, delta) + 0.5 * params[2] * np.dot(u, u)
+      return np.where(t == T, terminal_cost, stagewise_cost)
+
+    def equality_constraint(x, u, t):
+      del u
+
+      # maximum constraint dimension across time steps
+      dim = 4
+
+      def goal_constraint(x):
+        err = x - goal
+        return err
+
+      return np.where(t == T, goal_constraint(x), np.zeros(dim))
+
+    def inequality_constraint(x, u, t):
+      del x
+
+      # maximum constraint dimension across time steps
+      dim = 2
+
+      def control_limits(u):
+        return np.array([u_lower - u[0], u[0] - u_upper])
+
+      return np.where(t == T, np.zeros(dim), control_limits(u))
+
+    params = np.array([0.0, 0.1, 0.01])  # no terminal cost
+    constraints_threshold = 1.0e-3
+
+    X0 = [
+        np.zeros(4),
+        np.array([0.1, 0.1, 0.1, 0.1]),
+        np.array([1.0, 0.0, 0.0, 0.0]),
+    ]
+    U0 = [np.zeros((T, 1)), 1.0 * np.ones((T, 1))]
+
+    for U in U0:
+      for x0 in X0:
+
+        sol = optimizers.constrained_ilqr(
+            functools.partial(cost, params=params), dynamics, x0, U,
+            equality_constraint=equality_constraint,
+            inequality_constraint=inequality_constraint,
+            constraints_threshold=constraints_threshold,
+            maxiter_al=10)
+
+        # test constraints
+        X = sol[0]
+        U = sol[1]
+        equality_constraints = sol[5]
+        inequality_constraints = sol[6]
+
+        self.assertLess(
+            np.linalg.norm(equality_constraints, ord=np.inf),
+            constraints_threshold)
+        self.assertLess(
+            np.max(inequality_constraints[inequality_constraints > 0.0]),
+            constraints_threshold)
+        self.assertFalse(np.any(U < u_lower - constraints_threshold))
+        self.assertFalse(np.any(U > u_upper + constraints_threshold))
+        self.assertLess(
+            np.linalg.norm(X[-1] - goal, ord=np.inf), constraints_threshold)
+
+  def testConstrainedCarSolve(self):
+    T = 25
+    dt = 0.1
+    n = 3
+    m = 2
+    goal = np.array([1.0, 0.0, 0.0])
+
+    def car(x, u, t):
+      del t
+      return np.array([u[0] * np.cos(x[2]), u[0] * np.sin(x[2]), u[1]])
+
+    dynamics = rk4(car, dt=dt)
+
+    cost_args = {
+        'x_stage_cost': 0.1,
+        'u_stage_cost': 1.0,
+    }
+
+    def cost(x, u, t, x_stage_cost, u_stage_cost):
+      delta = x - goal
+      stagewise_cost = 0.5 * x_stage_cost * np.dot(
+          delta, delta) + 0.5 * u_stage_cost * np.dot(u, u)
+      return np.where(t == T, 0.0, stagewise_cost)
+
+    def equality_constraint(x, u, t):
+      del u
+
+      # maximum constraint dimension across time steps
+      dim = 3
+
+      def goal_constraint(x):
+        err = x - goal
+        return err
+
+      return np.where(t == T, goal_constraint(x), np.zeros(dim))
+
+    # obstacles
+    obs1 = {'px': 0.5, 'py': 0.01, 'r': 0.25}
+
+    # control limits
+    u_lower = -1.0 * np.ones(m)
+    u_upper = 1.0 * np.ones(m)
+
+    def inequality_constraint(x, u, t):
+      def obstacles(x):
+        return np.array([
+            obs1['r'] - np.sqrt((x[0] - obs1['px'])**2.0 +
+                                (x[1] - obs1['py'])**2.0)
+        ])
+
+      def control_limits(u):
+        return np.concatenate((u_lower - u, u - u_upper))
+
+      return np.where(t == T, np.concatenate((np.zeros(2 * m), obstacles(x))),
+                      np.concatenate((control_limits(u), obstacles(x))))
+
+    x0 = np.zeros(n)
+    U = np.zeros((T, m))
+
+    constraints_threshold = 1.0e-3
+
+    sol = optimizers.constrained_ilqr(
+        functools.partial(cost, **cost_args), dynamics, x0, U,
+        equality_constraint=equality_constraint,
+        inequality_constraint=inequality_constraint,
+        constraints_threshold=constraints_threshold,
+        maxiter_al=10)
+
+    # test constraints
+    X = sol[0]
+    U = sol[1]
+    equality_constraints = sol[5]
+    inequality_constraints = sol[6]
+
+    self.assertLess(
+        np.linalg.norm(equality_constraints, ord=np.inf), constraints_threshold)
+    self.assertLess(
+        np.max(inequality_constraints[inequality_constraints > 0.0]),
+        constraints_threshold)
+    self.assertFalse(np.any(U < u_lower - constraints_threshold))
+    self.assertFalse(np.any(U > u_upper + constraints_threshold))
+    self.assertLess(
+        np.linalg.norm(X[-1] - goal, ord=np.inf), constraints_threshold)
+
 
 if __name__ == '__main__':
   absltest.main()

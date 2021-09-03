@@ -686,6 +686,7 @@ def scipy_minimize(cost,
 
 # Sampling based Zeroth Order Optimization via Cross-Entropy Method
 
+
 def default_cem_hyperparams():
   return {
       'sampling_smoothing': 0.,
@@ -870,3 +871,196 @@ def random_shooting(cost,
   X = rollout(dynamics, mean, init_state)
   obj = objective(cost, dynamics, mean, init_state)
   return X, U, obj
+
+
+# Constrained Iterative LQR
+
+
+@partial(jit, static_argnums=(0, 1, 4, 5, 12,))
+def constrained_ilqr(
+    cost,
+    dynamics,
+    x0,
+    U,
+    equality_constraint=lambda x, u, t: np.empty(1),
+    inequality_constraint=lambda x, u, t: np.empty(1),
+    maxiter_al=5,
+    maxiter_ilqr=100,
+    grad_norm_threshold=1.0e-4,
+    constraints_threshold=1.0e-2,
+    penalty_init=1.0,
+    penalty_update_rate=10.0,
+    make_psd=True,
+    psd_delta=0.0,
+    alpha_0=1.0,
+    alpha_min=0.00005):
+  """Constrained Iterative Linear Quadratic Regulator.
+
+  Args:
+    cost:      cost(x, u, t) returns scalar.
+    dynamics:  dynamics(x, u, t) returns next state (n, ) nd array.
+    x0: initial_state - 1D np array of shape (n, ); should satisfy constraints
+      at t == 0.
+
+    U: initial_controls - 2D np array of shape (T, m); this input does not have
+      to be initially feasible.
+    equality_constraint: equality_constraint(x, u, t) == 0 returns
+      (num_equality, ) nd array.
+    inequality_constraint: inequality_constraint(x, u, t) <= 0 returns
+      (num_inequality, ) nd array.
+    maxiter_al: maximum number of outer-loop augmented Lagrangian dual and
+      penalty updates.
+    maxiter_ilqr: maximum iterations for iLQR.
+    grad_norm_threshold: tolerance for stopping iLQR optimization
+      before augmented Lagrangian update.
+    constraints_threshold: tolerance for constraint violation (infinity norm).
+    penalty_init: initial penalty value.
+    penalty_update_rate: update rate for increasing penalty.
+    make_psd: whether to zero negative eigenvalues after quadratization.
+    psd_delta: The delta value to make the problem PSD. Specifically, it will
+      ensure that d^2c/dx^2 and d^2c/du^2, i.e. the hessian of cost function
+      with respect to state and control are always positive definite.
+    alpha_0: initial line search value.
+    alpha_min: minimum line search value.
+
+  Returns:
+    X: optimal state trajectory - nd array of shape (T+1, n).
+    U: optimal control trajectory - nd array of shape (T, m).
+    dual_equality: approximate dual (equality) trajectory - nd array of shape
+      (T+1, num_equality).
+    dual_inequality: approximate dual (inequality) trajectory nd array of shape
+      (T+1, num_inequality).
+    penalty: final penalty value.
+    equality_constraints: final constraint (equality) violation trajectory - nd
+      array of shape (T+1, num_equality).
+    inequality_constraints: final constraint (inequality) violation trajectory -
+      nd array of shape (T+1, num_inequality).
+    max_constraint_violation: maximum equality or inequality violation.
+    obj: final augmented Lagrangian objective achieved.
+    gradient: gradient at the solution returned.
+    iteration_ilqr: cumulative number of iLQR iterations for entire constrained
+      solve upon convergence.
+    iteration_al: number of augmented Lagrangian outer-loop iterations upon
+      convergence.
+
+  """
+
+  # horizon
+  horizon = len(U) + 1
+  t_range = np.arange(horizon)
+
+  # rollout
+  X = rollout(dynamics, U, x0)
+
+  # augmented Lagrangian methods
+  def augmented_lagrangian(x, u, t, dual_equality, dual_inequality, penalty):
+    # stage cost
+    J = cost(x, u, t)
+
+    # stage equality constraint
+    equality = equality_constraint(x, u, t)
+
+    # stage inequality constraint
+    inequality = inequality_constraint(x, u, t)
+
+    # active set
+    active_set = np.invert(np.isclose(dual_inequality[t], 0.0) & (inequality < 0.0))
+
+    # update cost
+    # TODO(taylorhowell): Gauss-Newton approximation for constraints,
+    # specifically in the Hessian of the objective
+    J += dual_equality[t].T @ equality + 0.5 * penalty * equality.T @ equality
+    J += dual_inequality[t].T @ inequality + 0.5 * penalty * inequality.T @ (
+        active_set * inequality)
+
+    return J
+
+  def dual_update(constraint, dual, penalty):
+    return dual + penalty * constraint
+
+  def inequality_projection(dual):
+    return np.maximum(dual, 0.0)
+
+  # vectorize
+  equality_constraint_mapped = vectorize(equality_constraint)
+  inequality_constraint_mapped = vectorize(inequality_constraint)
+  dual_update_mapped = vmap(dual_update, in_axes=(0, 0, None))
+
+  # evaluate constraints
+  U_pad = pad(U)
+  equality_constraints = equality_constraint_mapped(X, U_pad, t_range)
+  inequality_constraints = inequality_constraint_mapped(X, U_pad, t_range)
+
+  # initialize dual variables
+  dual_equality = np.zeros_like(equality_constraints)
+  dual_inequality = np.zeros_like(inequality_constraints)
+
+  # initialize penalty
+  penalty = penalty_init
+
+  def body(inputs):
+    # unpack
+    _, U, dual_equality, dual_inequality, penalty, equality_constraints, inequality_constraints, _, _, _, iteration_ilqr, iteration_al = inputs
+
+    # augmented Lagrangian parameters
+    al_args = {
+        'dual_equality': dual_equality,
+        'dual_inequality': dual_inequality,
+        'penalty': penalty,
+    }
+
+    # solve iLQR problem
+    X, U, obj, gradient, _, _, iteration = ilqr(
+        partial(augmented_lagrangian, **al_args),
+        dynamics,
+        x0,
+        U,
+        grad_norm_threshold=grad_norm_threshold,
+        make_psd=make_psd,
+        psd_delta=psd_delta,
+        alpha_0=alpha_0,
+        alpha_min=alpha_min,
+        maxiter=maxiter_ilqr)
+
+    # evalute constraints
+    U_pad = pad(U)
+
+    equality_constraints = equality_constraint_mapped(X, U_pad, t_range)
+
+    inequality_constraints = inequality_constraint_mapped(X, U_pad, t_range)
+    inequality_constraints_projected = inequality_projection(
+        inequality_constraints)
+
+    max_constraint_violation = np.maximum(
+        np.max(np.abs(equality_constraints)),
+        np.max(inequality_constraints_projected))
+
+    # augmented Lagrangian update
+    dual_equality = dual_update_mapped(equality_constraints, dual_equality,
+                                       penalty)
+
+    dual_inequality = dual_update_mapped(inequality_constraints,
+                                         dual_inequality, penalty)
+    dual_inequality = inequality_projection(dual_inequality)
+
+    penalty *= penalty_update_rate
+
+    # increment
+    iteration_ilqr += iteration
+    iteration_al += 1
+
+    return X, U, dual_equality, dual_inequality, penalty, equality_constraints, inequality_constraints, max_constraint_violation, obj, gradient, iteration_ilqr, iteration_al
+
+  def continuation_criteria(inputs):
+    # unpack
+    max_constraint_violation = inputs[7]
+    iteration_al = inputs[11]
+    # check maximum constraint violation and augmented Lagrangian iterations
+    return np.logical_and(iteration_al < maxiter_al,
+                          max_constraint_violation > constraints_threshold)
+
+  return lax.while_loop(
+      continuation_criteria, body,
+      (X, U, dual_equality, dual_inequality, penalty,
+       equality_constraints, inequality_constraints, np.inf, np.inf,
+       np.full(U.shape, np.inf), 0, 0))
