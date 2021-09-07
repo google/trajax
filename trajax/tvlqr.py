@@ -134,20 +134,27 @@ def tvlqr(Q, q, R, r, M, A, B, c):
   m = R.shape[1]
   n = Q.shape[1]
 
+  P = np.zeros((T+1, n, n))
+  p = np.zeros((T+1, n))
   K = np.zeros((T, m, n))
   k = np.zeros((T, m))
+
+  P = P.at[-1].set(Q[T])
+  p = p.at[-1].set(q[T])
 
   def body(tt, inputs):
     K, k, P, p = inputs
     t = T - 1 - tt
-    P, p, K_t, k_t = lqr_step(P, p, Q[t], q[t], R[t], r[t], M[t], A[t], B[t],
-                              c[t])
+    P_t, p_t, K_t, k_t = lqr_step(P[t+1], p[t+1], Q[t], q[t], R[t], r[t], M[t],
+                                  A[t], B[t], c[t])
     K = ops.index_update(K, ops.index[t], K_t)
     k = ops.index_update(k, ops.index[t], k_t)
+    P = ops.index_update(P, ops.index[t], P_t)
+    p = ops.index_update(p, ops.index[t], p_t)
 
     return K, k, P, p
 
-  return lax.fori_loop(0, T, body, (K, k, Q[T], q[T]))
+  return lax.fori_loop(0, T, body, (K, k, P, p))
 
 
 @partial(jit, static_argnums=(0,))
