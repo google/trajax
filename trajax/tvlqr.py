@@ -46,14 +46,14 @@ def rollout(K, k, x0, A, B, c):
   T, m, n = K.shape
   X = np.zeros((T + 1, n))
   U = np.zeros((T, m))
-  X = ops.index_update(X, ops.index[0], x0)
+  X = X.at[0].set(x0)
 
   def body(t, inputs):
     X, U = inputs
     u = np.matmul(K[t], X[t]) + k[t]
     x = np.matmul(A[t], X[t]) + np.matmul(B[t], u) + c[t]
-    X = ops.index_update(X, ops.index[t + 1], x)
-    U = ops.index_update(U, ops.index[t], u)
+    X = X.at[t + 1].set(x)
+    U = U.at[t].set(u)
     return X, U
 
   return lax.fori_loop(0, T, body, (X, U))
@@ -147,10 +147,10 @@ def tvlqr(Q, q, R, r, M, A, B, c):
     t = T - 1 - tt
     P_t, p_t, K_t, k_t = lqr_step(P[t+1], p[t+1], Q[t], q[t], R[t], r[t], M[t],
                                   A[t], B[t], c[t])
-    K = ops.index_update(K, ops.index[t], K_t)
-    k = ops.index_update(k, ops.index[t], k_t)
-    P = ops.index_update(P, ops.index[t], P_t)
-    p = ops.index_update(p, ops.index[t], p_t)
+    K = K.at[t].set(K_t)
+    k = k.at[t].set(k_t)
+    P = P.at[t].set(P_t)
+    p = p.at[t].set(p_t)
 
     return K, k, P, p
 

@@ -344,15 +344,15 @@ def ddp_rollout(dynamics, X, U, K, k, alpha, *args):
   T, m = U.shape
   Xnew = np.zeros((T + 1, n))
   Unew = np.zeros((T, m))
-  Xnew = ops.index_update(Xnew, ops.index[0], X[0])
+  Xnew = Xnew.at[0].set(X[0])
 
   def body(t, inputs):
     Xnew, Unew = inputs
     del_u = alpha * k[t] + np.matmul(K[t], Xnew[t] - X[t])
     u = U[t] + del_u
     x = dynamics(Xnew[t], u, t, *args)
-    Unew = ops.index_update(Unew, ops.index[t], u)
-    Xnew = ops.index_update(Xnew, ops.index[t + 1], x)
+    Unew = Unew.at[t].set(u)
+    Xnew = Xnew.at[t + 1].set(x)
     return Xnew, Unew
 
   return lax.fori_loop(0, T, body, (Xnew, Unew))
@@ -742,9 +742,8 @@ def gaussian_samples(random_key, mean, stdev, control_low, control_high,
   smoothing_coef = hyperparams['sampling_smoothing']
 
   def body_fun(t, noises):
-    return jax.ops.index_update(
-        noises, jax.ops.index[:, t], smoothing_coef * noises[:, t - 1] +
-        np.sqrt(1 - smoothing_coef**2) * noises[:, t])
+    return noises.at[:, t].set(smoothing_coef * noises[:, t - 1] +
+                               np.sqrt(1 - smoothing_coef**2) * noises[:, t])
 
   noises = jax.lax.fori_loop(1, horizon, body_fun, noises)
   samples = noises * stdev
