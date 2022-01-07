@@ -236,7 +236,7 @@ def _objective_fwd(cost, dynamics, U, x0, cost_args, dynamics_args):
 
 
 def _objective_bwd(cost, dynamics, res, g):
-  return (g * _grad_wrt_inputs(cost, dynamics, *res),) + (None,) * 3
+  return (g * grad_wrt_controls(cost, dynamics, *res),) + (None,) * 3
 
 
 _objective.defvjp(_objective_fwd, _objective_bwd)
@@ -275,7 +275,7 @@ def adjoint(A, B, q, r):
   return np.flipud(g), np.vstack((np.flipud(P[:T - 1]), q[T])), p
 
 
-def _grad_wrt_inputs(cost, dynamics, U, x0, cost_args, dynamics_args):
+def grad_wrt_controls(cost, dynamics, U, x0, cost_args, dynamics_args):
   """Evaluates gradient at a control sequence.
 
   Args:
@@ -315,7 +315,7 @@ def hvp(cost, dynamics, U, x0, V, cost_args, dynamics_args):
   Returns:
     gradient (T, m) of total cost with respect to controls.
   """
-  grad_fn = partial(_grad_wrt_inputs, cost, dynamics)
+  grad_fn = partial(grad_wrt_controls, cost, dynamics)
   return jax.jvp(lambda U1: grad_fn(U1, x0, cost_args, dynamics_args), (U,),
                  (V,))
 
@@ -450,14 +450,14 @@ def ilqr(cost,
   cost_fn, cost_args = custom_derivatives.closure_convert(cost, x0, U[0], 0)
   dynamics_fn, dynamics_args = custom_derivatives.closure_convert(
       dynamics, x0, U[0], 0)
-  return _ilqr(cost_fn, dynamics_fn, x0, U, tuple(cost_args),
+  return ilqr_base(cost_fn, dynamics_fn, x0, U, tuple(cost_args),
                tuple(dynamics_args), maxiter, grad_norm_threshold, make_psd,
                psd_delta, alpha_0, alpha_min)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
 @partial(jit, static_argnums=(0, 1))
-def _ilqr(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
+def ilqr_base(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
           grad_norm_threshold, make_psd, psd_delta, alpha_0, alpha_min):
   """ilqr implementation."""
 
@@ -529,7 +529,7 @@ def _ilqr(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
 
 def _ilqr_fwd(cost, dynamics, *args):
   """Forward pass of custom vector-Jacobian product implementation."""
-  ilqr_output = _ilqr(cost, dynamics, *args)  # pylint: disable=no-value-for-parameter
+  ilqr_output = ilqr_base(cost, dynamics, *args)  # pylint: disable=no-value-for-parameter
   X, U, _, _, adjoints, lqr, _ = ilqr_output
   return ilqr_output, (args, X, U, adjoints, lqr)
 
@@ -560,7 +560,7 @@ def _ilqr_bwd(cost, dynamics, fwd_residuals, gX_gU_gNonDifferentiableOutputs):
   return (zeros_like_args[:2] + ((gradients, *zeros_like_args[2][1:]),) +
           zeros_like_args[3:])
 
-_ilqr.defvjp(_ilqr_fwd, _ilqr_bwd)
+ilqr_base.defvjp(_ilqr_fwd, _ilqr_bwd)
 
 
 def hamiltonian(cost, dynamics):
@@ -649,7 +649,7 @@ def scipy_minimize(cost,
   """
 
   obj_fn = jit(partial(objective, cost, dynamics))
-  grad_fn = jit(partial(_grad_wrt_inputs, cost, dynamics,
+  grad_fn = jit(partial(grad_wrt_controls, cost, dynamics,
                         cost_args=(), dynamics_args=()))
   T, m = U.shape
 

@@ -266,7 +266,7 @@ class OptimizersTest(parameterized.TestCase):
     objective = functools.partial(optimizers.objective,
                                   functools.partial(cost, params=params_cost),
                                   dynamics)
-    grad = functools.partial(optimizers._grad_wrt_inputs, cost, dynamics)
+    grad = functools.partial(optimizers.grad_wrt_controls, cost, dynamics)
     gradient = grad(U, x0, (params_cost,), ())
 
     def obj(Uflat):
@@ -295,7 +295,7 @@ class OptimizersTest(parameterized.TestCase):
     obj = functools.partial(optimizers.objective,
                             functools.partial(cost, params=params_cost),
                             dynamics)
-    grad = functools.partial(optimizers._grad_wrt_inputs, cost, dynamics)
+    grad = functools.partial(optimizers.grad_wrt_controls, cost, dynamics)
     gradient = grad(U, x0, (params_cost,), ())
     jax_gradient = jax.grad(obj)(U, x0)
     self.assertTrue(np.allclose(gradient, jax_gradient))
