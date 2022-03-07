@@ -57,7 +57,6 @@ from jax import hessian
 from jax import jacobian
 from jax import jit
 from jax import lax
-from jax import ops
 from jax import random
 from jax import vmap
 import jax.numpy as np
@@ -451,14 +450,14 @@ def ilqr(cost,
   dynamics_fn, dynamics_args = custom_derivatives.closure_convert(
       dynamics, x0, U[0], 0)
   return ilqr_base(cost_fn, dynamics_fn, x0, U, tuple(cost_args),
-               tuple(dynamics_args), maxiter, grad_norm_threshold, make_psd,
-               psd_delta, alpha_0, alpha_min)
+                   tuple(dynamics_args), maxiter, grad_norm_threshold, make_psd,
+                   psd_delta, alpha_0, alpha_min)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
 @partial(jit, static_argnums=(0, 1))
 def ilqr_base(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
-          grad_norm_threshold, make_psd, psd_delta, alpha_0, alpha_min):
+              grad_norm_threshold, make_psd, psd_delta, alpha_0, alpha_min):
   """ilqr implementation."""
 
   T, m = U.shape
@@ -963,7 +962,8 @@ def constrained_ilqr(
     inequality = inequality_constraint(x, u, t)
 
     # active set
-    active_set = np.invert(np.isclose(dual_inequality[t], 0.0) & (inequality < 0.0))
+    active_set = np.invert(
+        np.isclose(dual_inequality[t], 0.0) & (inequality < 0.0))
 
     # update cost
     # TODO(taylorhowell): Gauss-Newton approximation for constraints,
@@ -1052,11 +1052,17 @@ def constrained_ilqr(
 
   def continuation_criteria(inputs):
     # unpack
+    dual_inequality = inputs[3]
+    inequality_constraints = inputs[6]
     max_constraint_violation = inputs[7]
     iteration_al = inputs[11]
+    max_complementary_slack = np.max(
+        np.abs(inequality_constraints * dual_inequality))
     # check maximum constraint violation and augmented Lagrangian iterations
     return np.logical_and(iteration_al < maxiter_al,
-                          max_constraint_violation > constraints_threshold)
+                          np.logical_or(
+                              max_constraint_violation > constraints_threshold,
+                              max_complementary_slack > constraints_threshold))
 
   return lax.while_loop(
       continuation_criteria, body,
