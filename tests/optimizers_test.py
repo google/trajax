@@ -29,6 +29,7 @@ import jax
 from jax import device_put
 from jax import vmap
 from jax.config import config
+import jax.flatten_util
 import jax.numpy as np
 import numpy as onp
 from six.moves import range
@@ -347,7 +348,11 @@ class OptimizersTest(parameterized.TestCase):
     self.assertLess(obj, optimal_obj)
     self.assertLess(np.linalg.norm(gradient), 1e-4)
 
-  def testCustomVJP(self):
+  @parameterized.named_parameters(
+      ('explicit', 'explicit', {}),
+      ('cg', 'cg', {'tol': 1e-8}),
+      ('tvlqr', 'tvlqr', {}))
+  def testCustomVJP(self, vjp_method, vjp_options):
     horizon = 5
     dynamics = rk4(pendulum, dt=0.01)
 
@@ -372,7 +377,9 @@ class OptimizersTest(parameterized.TestCase):
     def solve(params, x0):
       u0 = np.zeros((horizon, 1))
       xs, us, *_ = optimizers.ilqr(
-          functools.partial(cost, params), dynamics, x0, u0)
+          functools.partial(cost, params), dynamics, x0, u0,
+          vjp_method=vjp_method,
+          vjp_options=vjp_options)
       return xs, us
 
     expert = functools.partial(solve, true_params)
@@ -390,7 +397,11 @@ class OptimizersTest(parameterized.TestCase):
     assert params.shape == grad.shape
     assert np.linalg.norm(grad_fn(np.array(true_params))) <= 1e-5
 
-  def testCustomVJPPyTree(self):
+  @parameterized.named_parameters(
+      ('explicit', 'explicit', {}),
+      ('cg', 'cg', {'tol': 1e-8}),
+      ('tvlqr', 'tvlqr', {}))
+  def testCustomVJPPyTree(self, vjp_method, vjp_options):
     horizon = 5
     dynamics = rk4(pendulum, dt=0.01)
 
@@ -427,13 +438,17 @@ class OptimizersTest(parameterized.TestCase):
     def loss(params):
       u0 = np.zeros((horizon, 1))
       xs, us, *_ = optimizers.ilqr(
-          functools.partial(cost, params), dynamics, x0, u0)
+          functools.partial(cost, params), dynamics, x0, u0,
+          vjp_method=vjp_method,
+          vjp_options=vjp_options)
       return np.sum(np.square(xs)) + np.sum(np.square(us))
 
     def pytree_loss(params):
       u0 = np.zeros((horizon, 1))
       xs, us, *_ = optimizers.ilqr(
-          functools.partial(pytree_cost, params), dynamics, x0, u0)
+          functools.partial(pytree_cost, params), dynamics, x0, u0,
+          vjp_method=vjp_method,
+          vjp_options=vjp_options)
       return np.sum(np.square(xs)) + np.sum(np.square(us))
 
     def multiparam_loss(final_weight, stage_weight, action_weight):
@@ -441,7 +456,9 @@ class OptimizersTest(parameterized.TestCase):
       xs, us, *_ = optimizers.ilqr(
           functools.partial(multiparam_cost,
                             final_weight, stage_weight, action_weight),
-          dynamics, x0, u0)
+          dynamics, x0, u0,
+          vjp_method=vjp_method,
+          vjp_options=vjp_options)
       return np.sum(np.square(xs)) + np.sum(np.square(us))
 
     params = np.array([10.0, 1.0, 0.01])
@@ -487,6 +504,48 @@ class OptimizersTest(parameterized.TestCase):
         functools.partial(cost, true_params), dynamics, x0, U0)
     assert np.abs(angle_wrap(X[-1, 0] - np.pi)) <= 0.1
     assert np.abs(X[-1, 1]) <= 0.1
+
+  def testCustomVJPConsistency(self):
+    vjp_methods = ('explicit', 'cg', 'tvlqr')
+    vjp_options_per_method = ({}, {'tol': 1e-8}, {})
+
+    T = 5
+    goal = np.array([np.pi, 0.0, 0.0, 0.0])
+    dynamics = euler(acrobot, dt=0.1)
+
+    def cost(x, u, t, params):
+      delta = x - goal
+      terminal_cost = 0.5 * params[0] * np.dot(delta, delta)
+      stagewise_cost = 0.5 * params[1] * np.dot(
+          delta, delta) + 0.5 * params[2] * np.dot(u, u)
+      return np.where(t == T, terminal_cost, stagewise_cost)
+
+    x0 = np.zeros(4)
+    U0 = np.zeros((T, 1))
+    params = np.array([100.0, 0.1, 0.5])
+
+    def make_jac_function(vjp_method, vjp_options):
+      def fn(params):
+        X, U, _, _, _, _, _ = optimizers.ilqr(
+            lambda x, u, t: cost(x, u, t, params),
+            dynamics,
+            x0,
+            U0,
+            vjp_method=vjp_method,
+            vjp_options=vjp_options)
+        return X, U
+      return jax.jacobian(fn)
+
+    jacs = [make_jac_function(vjp_method, vjp_options)(params)
+            for vjp_method, vjp_options in
+            zip(vjp_methods, vjp_options_per_method)]
+    def pytree_allclose(a, b, *args, **kwargs):
+      return jax.flatten_util.ravel_pytree(
+          jax.tree_map(lambda x, y: np.allclose(x, y, *args, **kwargs), a,
+                       b))[0].all()
+    for dX, dU in jacs[1:]:
+      self.assertTrue(pytree_allclose(jacs[0][0], dX, atol=1e-6, rtol=1e-6))
+      self.assertTrue(pytree_allclose(jacs[0][1], dU, atol=1e-6, rtol=1e-6))
 
   def testCEMUpdateMeanStdev(self):
     num_samples, horizon, dim_control = 400, 20, 1

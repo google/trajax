@@ -59,12 +59,29 @@ from jax import lax
 from jax import random
 from jax import vmap
 import jax.numpy as np
+import jax.scipy as sp
 import scipy.optimize as osp_optimize
 from trajax.tvlqr import rollout as tvlqr_rollout
 from trajax.tvlqr import tvlqr
 
 # Convenience routine to pad zeros for vectorization purposes.
 pad = lambda A: np.vstack((A, np.zeros((1,) + A.shape[1:])))
+
+
+def _pytree_zeros_like(tree):
+  return jax.tree_map(np.zeros_like, tree)
+
+
+def _pytree_scale(tree, scale):
+  return jax.tree_map(lambda leaf: scale * leaf, tree)
+
+
+def _pytree_negate(tree):
+  return _pytree_scale(tree, -1.0)
+
+
+def _pytree_add(tree0, tree1):
+  return jax.tree_map(lambda x, y: x + y, tree0, tree1)
 
 
 def vectorize(fun, argnums=3):
@@ -221,11 +238,16 @@ def objective(cost, dynamics, U, x0):
                     dynamics_consts)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 1))
-def _objective(cost, dynamics, U, x0, cost_args, dynamics_args):
+# no custom_vjp attached
+def _objective_template(cost, dynamics, U, x0, cost_args, dynamics_args):
   return np.sum(
       evaluate(cost, _rollout(dynamics, U, x0, *dynamics_args), pad(U),
                *cost_args))
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1))
+def _objective(cost, dynamics, U, x0, cost_args, dynamics_args):
+  return _objective_template(cost, dynamics, U, x0, cost_args, dynamics_args)
 
 
 def _objective_fwd(cost, dynamics, U, x0, cost_args, dynamics_args):
@@ -419,8 +441,21 @@ def ilqr(cost,
          make_psd=False,
          psd_delta=0.0,
          alpha_0=1.0,
-         alpha_min=0.00005):
+         alpha_min=0.00005,
+         vjp_method='tvlqr',
+         vjp_options=None):
   """Iterative Linear Quadratic Regulator.
+
+  This method supports differentiation of the (X, U) outputs with respect
+  to any parameters closed over in the cost function.
+
+  Note that if you attempt to differentiate with respect to either
+  inputs that are not closed over in the cost, or outputs other than (X, U),
+  there will be no warning.
+
+  Future implementations will support the differentiation of (X, U, obj)
+  with respect to x0 and the parameters closed over in either the cost
+  or dynamics functions.
 
   Args:
     cost:      cost(x, u, t) returns scalar.
@@ -435,16 +470,41 @@ def ilqr(cost,
       with respect to state and control are always positive definite.
     alpha_0: initial line search value.
     alpha_min: minimum line search value.
+    vjp_method: One of ('explicit', 'cg', 'tvlqr'). Defaults to 'tvlqr'. The
+      methods describe how the inv(hess) * v problem is solved in applying the
+      implicit function theorem. The method 'explicit' refers to fully
+      materializing the Hessian in memory and relying on jax.numpy.linalg.solve.
+      The method 'cg' never materizlies the Hessian, and instead uses
+      jax.scipy.sparse.linalg.cg and Hessian vector products. The method 'tvlqr'
+      utilizes the structure of ilqr to solve inv(hess) * v with another
+      call to tvlqr.
+    vjp_options: A dictionary containing optional parameters to pass to the
+      vjp implementation. The valid keys depend on the vjp_method. For
+      method 'explicit', vjp_options accepts a key 'regularization' with a float
+      value, which is added to the Hessian to improve numerical conditioning.
+      For method 'cg', in addition to 'regularization', vjp_options also
+      accepts keys ('tol', 'atol', 'maxiter'), which corresponds to the
+      options of jax.scipy.sparse.linalg.cg. Method 'tvlqr' does not have any
+      vjp_options.
 
   Returns:
     X: optimal state trajectory - nd array of shape (T+1, n).
+      Is a differentiable output.
     U: optimal control trajectory - nd array of shape (T, m).
+      Is a differentiable output.
     obj: final objective achieved.
     gradient: gradient at the solution returned.
     adjoints: associated adjoint variables.
     lqr: inputs to the final LQR solve.
     iteration: number of iterations upon convergence.
   """
+  valid_vjp_methods = ('explicit', 'cg', 'tvlqr')
+  if vjp_method not in valid_vjp_methods:
+    raise ValueError(f'vjp_method must be one of {valid_vjp_methods}, '
+                     f'got {vjp_method} instead.')
+  if vjp_options is None:
+    vjp_options = {}
+
   cost_fn, cost_args = custom_derivatives.closure_convert(cost, x0, U[0], 0)
   dynamics_fn, dynamics_args = custom_derivatives.closure_convert(
       dynamics, x0, U[0], 0)
@@ -452,24 +512,183 @@ def ilqr(cost,
     return cost_fn(x, u, t, *bundled_cost_args)
   def new_dynamics_fn(x, u, t, bundled_dynamics_args):
     return dynamics_fn(x, u, t, *bundled_dynamics_args)
-  # ilqr_base can only differentiate cost_args wrt the first argument of the
-  # cost_fn. so, we bundle all the cost_args as one pytree. this is not
-  # technically needed for dynamics_fn right now, since ilqr_base cannot
+  # _ilqr_tvlqr_vjp can only differentiate cost_args wrt the first argument of
+  # the cost_fn. so, we bundle all the cost_args as one pytree. this is not
+  # technically needed for dynamics_fn right now, since _ilqr_tvlqr_vjp cannot
   # diff wrt dynamics_args, but we do it anyways for consistency. future
-  # implementations of ilqr_base that want to diff wrt dynamics_args only need
-  # to handle the first arg without loss of generality. in fact, we could
+  # implementations of _ilqr_tvlqr_vjp that want to diff wrt dynamics_args only
+  # need to handle the first arg without loss of generality. in fact, we could
   # even ravel_pytree tuple(cost_args) here, and then all custom_vjp methods
   # would only need to reason about a vector argument wlog.
-  return ilqr_base(new_cost_fn, new_dynamics_fn, x0, U, (tuple(cost_args),),
-                   (tuple(dynamics_args),), maxiter, grad_norm_threshold,
-                   make_psd, psd_delta, alpha_0, alpha_min)
+
+  if vjp_method == 'explicit':
+    return _ilqr_explicit_vjp(new_cost_fn, new_dynamics_fn, x0, U,
+                              (tuple(cost_args),), (tuple(dynamics_args),),
+                              maxiter, grad_norm_threshold, make_psd, psd_delta,
+                              alpha_0, alpha_min, vjp_options)
+  elif vjp_method == 'cg':
+    return _ilqr_cg_vjp(new_cost_fn, new_dynamics_fn, x0, U,
+                        (tuple(cost_args),), (tuple(dynamics_args),),
+                        maxiter, grad_norm_threshold, make_psd, psd_delta,
+                        alpha_0, alpha_min, vjp_options)
+  else:
+    assert vjp_method == 'tvlqr'
+    return _ilqr_tvlqr_vjp(new_cost_fn, new_dynamics_fn, x0, U,
+                           (tuple(cost_args),), (tuple(dynamics_args),),
+                           maxiter, grad_norm_threshold, make_psd,
+                           psd_delta, alpha_0, alpha_min, vjp_options)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
 @partial(jit, static_argnums=(0, 1))
-def ilqr_base(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
-              grad_norm_threshold, make_psd, psd_delta, alpha_0, alpha_min):
-  """ilqr implementation."""
+def _ilqr_explicit_vjp(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
+                       grad_norm_threshold, make_psd, psd_delta, alpha_0,
+                       alpha_min, vjp_options):
+  return _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args,
+                        maxiter, grad_norm_threshold, make_psd, psd_delta,
+                        alpha_0, alpha_min, vjp_options)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1))
+@partial(jit, static_argnums=(0, 1))
+def _ilqr_cg_vjp(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
+                 grad_norm_threshold, make_psd, psd_delta, alpha_0,
+                 alpha_min, vjp_options):
+  return _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args,
+                        maxiter, grad_norm_threshold, make_psd, psd_delta,
+                        alpha_0, alpha_min, vjp_options)
+
+
+def _solve_hess_inv_v_explicit(obj_fn, U, v, options_dict):
+  assert U.shape == v.shape
+  U_shape = U.shape
+  def flat_obj_fn(flat_U):
+    return obj_fn(flat_U.reshape(U_shape))
+  H = jax.hessian(flat_obj_fn)(U.flatten())
+  H += options_dict.get('regularization', 0.0) * np.eye(H.shape[0])
+  return sp.linalg.solve(H, v.flatten()).reshape(U_shape)
+
+
+def _solve_hess_inv_v_cg(obj_fn, U, v, options_dict):
+  def _hvp(v):
+    return _pytree_add(
+        jax.jvp(jax.grad(obj_fn), (U,), (v,))[1],
+        _pytree_scale(v, options_dict.get('regularization', 0.0)))
+  return sp.sparse.linalg.cg(_hvp, v,
+                             tol=options_dict.get('tol', 1e-05),
+                             atol=options_dict.get('atol', 0.0),
+                             maxiter=options_dict.get('maxiter', None))[0]
+
+
+def _ilqr_explicit_fwd(cost, dynamics, *args):
+  ilqr_output = _ilqr_template(cost, dynamics, *args)
+  X, U, _, _, _, lqr, _ = ilqr_output
+  return ilqr_output, (args, X, U, lqr)
+
+
+def _ilqr_explicit_bwd(solve_hess_inv_v_fn, cost, dynamics, fwd_residuals,
+                       gX_gU_gNonDifferentiableOutputs):
+  """Backward pass of custom vector-Jacobian product implementation."""
+  args, _, U_star, _ = fwd_residuals
+  x0, _, cost_args, dynamics_args = args[:4]
+  vjp_options = args[-1]
+  gX, gU = gX_gU_gNonDifferentiableOutputs[:2]
+  # TODO(stephentu): can we throw an error if
+  # gX_gU_gNonDifferentiableOutputs[2:] is non-zero?
+
+  flat_params, unflatten_params = jax.flatten_util.ravel_pytree(
+      (x0, cost_args, dynamics_args))
+
+  def flatten_rollout(U, flat_params):
+    x0, _, dynamics_args = unflatten_params(flat_params)
+    return _rollout(dynamics, U, x0, *dynamics_args)
+
+  def obj_fn(U, flat_params):
+    x0, cost_args, dynamics_args = unflatten_params(flat_params)
+    return _objective_template(
+        cost, dynamics, U, x0, cost_args=cost_args, dynamics_args=dynamics_args)
+
+  _, rollout_vjp_U_fn = jax.vjp(flatten_rollout, U_star, flat_params)
+  gU_gX, grad_thru_X = rollout_vjp_U_fn(gX)
+
+  lhs = solve_hess_inv_v_fn(
+      lambda U: obj_fn(U, flat_params), U_star, gU + gU_gX, vjp_options)
+  _, rhs_vjp_fn = jax.vjp(
+      lambda flat_params: jax.grad(obj_fn, argnums=0)(U_star, flat_params),
+      flat_params)
+  grad_thru_U, = _pytree_negate(rhs_vjp_fn(lhs))
+
+  zeros_like_args = _pytree_zeros_like(args)
+  gradients = unflatten_params(grad_thru_U + grad_thru_X)
+  return (gradients[0],
+          zeros_like_args[1],
+          gradients[1],
+          gradients[2],
+          *zeros_like_args[4:])
+
+_ilqr_explicit_vjp.defvjp(
+    _ilqr_explicit_fwd,
+    partial(_ilqr_explicit_bwd, _solve_hess_inv_v_explicit))
+
+_ilqr_cg_vjp.defvjp(
+    _ilqr_explicit_fwd,
+    partial(_ilqr_explicit_bwd, _solve_hess_inv_v_cg))
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1))
+@partial(jit, static_argnums=(0, 1))
+def _ilqr_tvlqr_vjp(cost, dynamics, x0, U, cost_args, dynamics_args,
+                    maxiter, grad_norm_threshold, make_psd, psd_delta,
+                    alpha_0, alpha_min, vjp_options):
+  return _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args,
+                        maxiter, grad_norm_threshold, make_psd, psd_delta,
+                        alpha_0, alpha_min, vjp_options)
+
+
+def _ilqr_tvlqr_fwd(cost, dynamics, *args):
+  """Forward pass of custom vector-Jacobian product implementation."""
+  ilqr_output = _ilqr_template(cost, dynamics, *args)
+  X, U, _, _, adjoints, lqr, _ = ilqr_output
+  return ilqr_output, (args, X, U, adjoints, lqr)
+
+
+def _ilqr_tvlqr_bwd(cost, dynamics, fwd_residuals,
+                    gX_gU_gNonDifferentiableOutputs):
+  """Backward pass of custom vector-Jacobian product implementation."""
+  # TODO(schmrlng): Add gradient of `obj` with respect to inputs.
+  args, X, U, adjoints, lqr = fwd_residuals
+  x0, _, cost_args, dynamics_args = args[:4]
+  gX, gU = gX_gU_gNonDifferentiableOutputs[:2]
+
+  _, _, _, _, _, A, B = lqr
+  timesteps = np.arange(X.shape[0])
+
+  quadratizer = quadratize(hamiltonian(cost, dynamics), argnums=4)
+  Q, R, M = quadratizer(X, pad(U), timesteps, pad(adjoints), cost_args,
+                        dynamics_args)
+
+  c = np.zeros(A.shape[:2])
+  K, k, _, _ = tvlqr(Q, gX, R, gU, M, A, B, c)
+  _, dU = tvlqr_rollout(K, k, np.zeros_like(x0), A, B, c)
+
+  vhp = vhp_params(cost)
+  gradients = vhp(pad(dU), X, pad(U), A, B, *cost_args)[1]
+  zeros_like_args = _pytree_zeros_like(args)
+  # TODO(schmrlng): Add gradients with respect to `cost_args` other than the
+  # first, `x0`, and `dynamics_args`.
+  return (zeros_like_args[:2] + ((gradients, *zeros_like_args[2][1:]),) +
+          zeros_like_args[3:])
+
+
+_ilqr_tvlqr_vjp.defvjp(_ilqr_tvlqr_fwd, _ilqr_tvlqr_bwd)
+
+
+def _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
+                   grad_norm_threshold, make_psd, psd_delta, alpha_0,
+                   alpha_min, vjp_options):
+  """Internal ilqr implementation. Not meant to be called directly."""
+
+  del vjp_options
 
   T, m = U.shape
   n = x0.shape[0]
@@ -537,42 +756,6 @@ def ilqr_base(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
   return X, U, obj, gradient, adjoints, lqr, it
 
 
-def _ilqr_fwd(cost, dynamics, *args):
-  """Forward pass of custom vector-Jacobian product implementation."""
-  ilqr_output = ilqr_base(cost, dynamics, *args)  # pylint: disable=no-value-for-parameter
-  X, U, _, _, adjoints, lqr, _ = ilqr_output
-  return ilqr_output, (args, X, U, adjoints, lqr)
-
-
-def _ilqr_bwd(cost, dynamics, fwd_residuals, gX_gU_gNonDifferentiableOutputs):
-  """Backward pass of custom vector-Jacobian product implementation."""
-  # TODO(schmrlng): Add gradient of `obj` with respect to inputs.
-  args, X, U, adjoints, lqr = fwd_residuals
-  x0, _, cost_args, dynamics_args = args[:4]
-  gX, gU = gX_gU_gNonDifferentiableOutputs[:2]
-
-  _, _, _, _, _, A, B = lqr
-  timesteps = np.arange(X.shape[0])
-
-  quadratizer = quadratize(hamiltonian(cost, dynamics), argnums=4)
-  Q, R, M = quadratizer(X, pad(U), timesteps, pad(adjoints), cost_args,
-                        dynamics_args)
-
-  c = np.zeros(A.shape[:2])
-  K, k, _, _ = tvlqr(Q, gX, R, gU, M, A, B, c)
-  _, dU = tvlqr_rollout(K, k, np.zeros_like(x0), A, B, c)
-
-  vhp = vhp_params(cost)
-  gradients = vhp(pad(dU), X, pad(U), A, B, *cost_args)[1]
-  zeros_like_args = jax.tree_map(np.zeros_like, args)
-  # TODO(schmrlng): Add gradients with respect to `cost_args` other than the
-  # first, `x0`, and `dynamics_args`.
-  return (zeros_like_args[:2] + ((gradients, *zeros_like_args[2][1:]),) +
-          zeros_like_args[3:])
-
-ilqr_base.defvjp(_ilqr_fwd, _ilqr_bwd)
-
-
 def hamiltonian(cost, dynamics):
   """Returns function to evaluate associated Hamiltonian."""
 
@@ -619,10 +802,10 @@ def vhp_params(cost):
       Cx = hessian_x_params(X[t], U[t], t, *args)
       Cu = hessian_u_params(X[t], U[t], t, *args)
       w = np.matmul(B[t], vector[t])
-      g = jax.tree_multimap(
+      g = jax.tree_map(
           lambda P_, g_, Cu_: g_ + contract(vector[t], Cu_) + contract(w, P_),
           P, g, Cu)
-      P = jax.tree_multimap(lambda P_, Cx_: contract(A[t].T, P_) + Cx_, P, Cx)
+      P = jax.tree_map(lambda P_, Cx_: contract(A[t].T, P_) + Cx_, P, Cx)
       return P, g
 
     return lax.fori_loop(0, T, body, (Cx, gradient))
