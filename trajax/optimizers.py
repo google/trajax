@@ -448,9 +448,21 @@ def ilqr(cost,
   cost_fn, cost_args = custom_derivatives.closure_convert(cost, x0, U[0], 0)
   dynamics_fn, dynamics_args = custom_derivatives.closure_convert(
       dynamics, x0, U[0], 0)
-  return ilqr_base(cost_fn, dynamics_fn, x0, U, tuple(cost_args),
-                   tuple(dynamics_args), maxiter, grad_norm_threshold, make_psd,
-                   psd_delta, alpha_0, alpha_min)
+  def new_cost_fn(x, u, t, bundled_cost_args):
+    return cost_fn(x, u, t, *bundled_cost_args)
+  def new_dynamics_fn(x, u, t, bundled_dynamics_args):
+    return dynamics_fn(x, u, t, *bundled_dynamics_args)
+  # ilqr_base can only differentiate cost_args wrt the first argument of the
+  # cost_fn. so, we bundle all the cost_args as one pytree. this is not
+  # technically needed for dynamics_fn right now, since ilqr_base cannot
+  # diff wrt dynamics_args, but we do it anyways for consistency. future
+  # implementations of ilqr_base that want to diff wrt dynamics_args only need
+  # to handle the first arg without loss of generality. in fact, we could
+  # even ravel_pytree tuple(cost_args) here, and then all custom_vjp methods
+  # would only need to reason about a vector argument wlog.
+  return ilqr_base(new_cost_fn, new_dynamics_fn, x0, U, (tuple(cost_args),),
+                   (tuple(dynamics_args),), maxiter, grad_norm_threshold,
+                   make_psd, psd_delta, alpha_0, alpha_min)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))

@@ -390,6 +390,80 @@ class OptimizersTest(parameterized.TestCase):
     assert params.shape == grad.shape
     assert np.linalg.norm(grad_fn(np.array(true_params))) <= 1e-5
 
+  def testCustomVJPPyTree(self):
+    horizon = 5
+    dynamics = rk4(pendulum, dt=0.01)
+
+    # wrap to [-pi, pi]
+    def angle_wrap(theta):
+      return (theta + np.pi) % (2 * np.pi) - np.pi
+
+    def cost(params, state, action, t):
+      final_weight, stage_weight, action_weight = params
+      theta, theta_dot = state
+      theta_err = angle_wrap(theta - np.pi)
+      state_cost = stage_weight * (theta_err**2 + theta_dot**2)
+      action_cost = action_weight * np.squeeze(action)**2
+      return np.where(t == horizon, final_weight * state_cost,
+                      state_cost + action_cost)
+
+    def pytree_cost(params, state, action, t):
+      final_weight, stage_weight, action_weight = (params['final_weight'],
+                                                   params['stage_weight'],
+                                                   params['action_weight'])
+      return cost(
+          np.array([final_weight, stage_weight, action_weight]), state, action,
+          t)
+
+    def multiparam_cost(final_weight, stage_weight, action_weight,
+                        state, action, t):
+      return cost(
+          np.array([final_weight, stage_weight, action_weight]), state, action,
+          t)
+
+    key = jax.random.PRNGKey(0)
+    x0 = jax.random.normal(key, shape=(2,))
+
+    def loss(params):
+      u0 = np.zeros((horizon, 1))
+      xs, us, *_ = optimizers.ilqr(
+          functools.partial(cost, params), dynamics, x0, u0)
+      return np.sum(np.square(xs)) + np.sum(np.square(us))
+
+    def pytree_loss(params):
+      u0 = np.zeros((horizon, 1))
+      xs, us, *_ = optimizers.ilqr(
+          functools.partial(pytree_cost, params), dynamics, x0, u0)
+      return np.sum(np.square(xs)) + np.sum(np.square(us))
+
+    def multiparam_loss(final_weight, stage_weight, action_weight):
+      u0 = np.zeros((horizon, 1))
+      xs, us, *_ = optimizers.ilqr(
+          functools.partial(multiparam_cost,
+                            final_weight, stage_weight, action_weight),
+          dynamics, x0, u0)
+      return np.sum(np.square(xs)) + np.sum(np.square(us))
+
+    params = np.array([10.0, 1.0, 0.01])
+    pytree_params = {
+        'final_weight': 10.0,
+        'stage_weight': 1.0,
+        'action_weight': 0.01
+    }
+
+    grad_params = jax.jacobian(loss)(params)
+    grad_pytree_params = jax.jacobian(pytree_loss)(pytree_params)
+    assert np.allclose(
+        grad_params,
+        np.array([grad_pytree_params['final_weight'],
+                  grad_pytree_params['stage_weight'],
+                  grad_pytree_params['action_weight']]))
+
+    for idx, grad_param in enumerate(grad_params):
+      assert np.allclose(
+          grad_param,
+          jax.jacobian(multiparam_loss, argnums=idx)(*params))
+
   def testPendulumReadmeExample(self):
     horizon = 300
     dynamics = rk4(pendulum, dt=0.01)
