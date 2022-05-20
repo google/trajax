@@ -58,6 +58,7 @@ from jax import jit
 from jax import lax
 from jax import random
 from jax import vmap
+import jax.flatten_util
 import jax.numpy as np
 import jax.scipy as sp
 import scipy.optimize as osp_optimize
@@ -498,10 +499,7 @@ def ilqr(cost,
     lqr: inputs to the final LQR solve.
     iteration: number of iterations upon convergence.
   """
-  valid_vjp_methods = ('explicit', 'cg', 'tvlqr')
-  if vjp_method not in valid_vjp_methods:
-    raise ValueError(f'vjp_method must be one of {valid_vjp_methods}, '
-                     f'got {vjp_method} instead.')
+  valid_vjp_methods = ('explicit', 'cg', 'tvlqr', 'tvlqr_experimental')
   if vjp_options is None:
     vjp_options = {}
 
@@ -531,12 +529,21 @@ def ilqr(cost,
                         (tuple(cost_args),), (tuple(dynamics_args),),
                         maxiter, grad_norm_threshold, make_psd, psd_delta,
                         alpha_0, alpha_min, vjp_options)
-  else:
-    assert vjp_method == 'tvlqr'
+  elif vjp_method == 'tvlqr':
     return _ilqr_tvlqr_vjp(new_cost_fn, new_dynamics_fn, x0, U,
                            (tuple(cost_args),), (tuple(dynamics_args),),
                            maxiter, grad_norm_threshold, make_psd,
                            psd_delta, alpha_0, alpha_min, vjp_options)
+  elif vjp_method == 'tvlqr_experimental':
+    return _ilqr_tvlqr_experimental_vjp(new_cost_fn, new_dynamics_fn, x0, U,
+                                        (tuple(cost_args),),
+                                        (tuple(dynamics_args),), maxiter,
+                                        grad_norm_threshold, make_psd,
+                                        psd_delta, alpha_0, alpha_min,
+                                        vjp_options)
+  else:
+    raise ValueError(f'vjp_method must be one of {valid_vjp_methods}, '
+                     f'got {vjp_method} instead.')
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
@@ -559,17 +566,38 @@ def _ilqr_cg_vjp(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
                         alpha_0, alpha_min, vjp_options)
 
 
-def _solve_hess_inv_v_explicit(obj_fn, U, v, options_dict):
-  assert U.shape == v.shape
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1))
+@partial(jit, static_argnums=(0, 1))
+def _ilqr_tvlqr_experimental_vjp(cost, dynamics, x0, U, cost_args,
+                                 dynamics_args, maxiter, grad_norm_threshold,
+                                 make_psd, psd_delta, alpha_0, alpha_min,
+                                 vjp_options):
+  return _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args,
+                        maxiter, grad_norm_threshold, make_psd, psd_delta,
+                        alpha_0, alpha_min, vjp_options)
+
+
+def _solve_hess_inv_v_explicit(cost, dynamics, v, X, U, A, B, adjoints,
+                               cost_args, dynamics_args, options_dict):
+  """Solve inv(hess) v by explicitly materializing the Hessian."""
+  del A, B, adjoints
   U_shape = U.shape
   def flat_obj_fn(flat_U):
-    return obj_fn(flat_U.reshape(U_shape))
+    U = flat_U.reshape(U_shape)
+    return _objective_template(cost, dynamics, U, X[0],
+                               cost_args, dynamics_args)
   H = jax.hessian(flat_obj_fn)(U.flatten())
   H += options_dict.get('regularization', 0.0) * np.eye(H.shape[0])
   return sp.linalg.solve(H, v.flatten()).reshape(U_shape)
 
 
-def _solve_hess_inv_v_cg(obj_fn, U, v, options_dict):
+def _solve_hess_inv_v_cg(cost, dynamics, v, X, U, A, B, adjoints,
+                         cost_args, dynamics_args, options_dict):
+  """Solve inv(hess) v by Hessian vector products and CG."""
+  del A, B, adjoints
+  def obj_fn(U):
+    return _objective_template(cost, dynamics, U, X[0],
+                               cost_args, dynamics_args)
   def _hvp(v):
     return _pytree_add(
         jax.jvp(jax.grad(obj_fn), (U,), (v,))[1],
@@ -580,21 +608,36 @@ def _solve_hess_inv_v_cg(obj_fn, U, v, options_dict):
                              maxiter=options_dict.get('maxiter', None))[0]
 
 
+def _solve_hess_inv_v_tvlqr(cost, dynamics, v, X, U, A, B, adjoints,
+                            cost_args, dynamics_args, options_dict):
+  """Solve inv(hess) v by tvlqr."""
+  del options_dict
+  quadratizer = quadratize(hamiltonian(cost, dynamics), argnums=4)
+  Q, R, M = quadratizer(X, pad(U), np.arange(X.shape[0]), pad(adjoints),
+                        cost_args, dynamics_args)
+  c = np.zeros(A.shape[:2])
+  K, k, _, _ = tvlqr(Q, np.zeros_like(X), R, v, M, A, B, c)
+  _, dU = tvlqr_rollout(K, k, np.zeros_like(X[0]), A, B, c)
+  return -dU
+
+
 def _ilqr_explicit_fwd(cost, dynamics, *args):
   ilqr_output = _ilqr_template(cost, dynamics, *args)
-  X, U, _, _, _, lqr, _ = ilqr_output
-  return ilqr_output, (args, X, U, lqr)
+  X, U, _, _, adjoints, lqr, _ = ilqr_output
+  return ilqr_output, (args, X, U, adjoints, lqr)
 
 
 def _ilqr_explicit_bwd(solve_hess_inv_v_fn, cost, dynamics, fwd_residuals,
                        gX_gU_gNonDifferentiableOutputs):
   """Backward pass of custom vector-Jacobian product implementation."""
-  args, _, U_star, _ = fwd_residuals
+  args, X_star, U_star, adjoints, lqr = fwd_residuals
   x0, _, cost_args, dynamics_args = args[:4]
   vjp_options = args[-1]
   gX, gU = gX_gU_gNonDifferentiableOutputs[:2]
   # TODO(stephentu): can we throw an error if
   # gX_gU_gNonDifferentiableOutputs[2:] is non-zero?
+
+  _, _, _, _, _, A, B = lqr
 
   flat_params, unflatten_params = jax.flatten_util.ravel_pytree(
       (x0, cost_args, dynamics_args))
@@ -603,16 +646,16 @@ def _ilqr_explicit_bwd(solve_hess_inv_v_fn, cost, dynamics, fwd_residuals,
     x0, _, dynamics_args = unflatten_params(flat_params)
     return _rollout(dynamics, U, x0, *dynamics_args)
 
-  def obj_fn(U, flat_params):
-    x0, cost_args, dynamics_args = unflatten_params(flat_params)
-    return _objective_template(
-        cost, dynamics, U, x0, cost_args=cost_args, dynamics_args=dynamics_args)
-
   _, rollout_vjp_U_fn = jax.vjp(flatten_rollout, U_star, flat_params)
   gU_gX, grad_thru_X = rollout_vjp_U_fn(gX)
 
-  lhs = solve_hess_inv_v_fn(
-      lambda U: obj_fn(U, flat_params), U_star, gU + gU_gX, vjp_options)
+  lhs = solve_hess_inv_v_fn(cost, dynamics, gU + gU_gX, X_star, U_star,
+                            A, B, adjoints, cost_args, dynamics_args,
+                            vjp_options)
+
+  def obj_fn(U, flat_params):
+    x0, cost_args, dynamics_args = unflatten_params(flat_params)
+    return _objective_template(cost, dynamics, U, x0, cost_args, dynamics_args)
   _, rhs_vjp_fn = jax.vjp(
       lambda flat_params: jax.grad(obj_fn, argnums=0)(U_star, flat_params),
       flat_params)
@@ -633,6 +676,10 @@ _ilqr_explicit_vjp.defvjp(
 _ilqr_cg_vjp.defvjp(
     _ilqr_explicit_fwd,
     partial(_ilqr_explicit_bwd, _solve_hess_inv_v_cg))
+
+_ilqr_tvlqr_experimental_vjp.defvjp(
+    _ilqr_explicit_fwd,
+    partial(_ilqr_explicit_bwd, _solve_hess_inv_v_tvlqr))
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))

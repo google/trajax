@@ -351,7 +351,8 @@ class OptimizersTest(parameterized.TestCase):
   @parameterized.named_parameters(
       ('explicit', 'explicit', {}),
       ('cg', 'cg', {'tol': 1e-8}),
-      ('tvlqr', 'tvlqr', {}))
+      ('tvlqr', 'tvlqr', {}),
+      ('tvlqr_experimental', 'tvlqr_experimental', {}))
   def testCustomVJP(self, vjp_method, vjp_options):
     horizon = 5
     dynamics = rk4(pendulum, dt=0.01)
@@ -400,7 +401,8 @@ class OptimizersTest(parameterized.TestCase):
   @parameterized.named_parameters(
       ('explicit', 'explicit', {}),
       ('cg', 'cg', {'tol': 1e-8}),
-      ('tvlqr', 'tvlqr', {}))
+      ('tvlqr', 'tvlqr', {}),
+      ('tvlqr_experimental', 'tvlqr_experimental', {}))
   def testCustomVJPPyTree(self, vjp_method, vjp_options):
     horizon = 5
     dynamics = rk4(pendulum, dt=0.01)
@@ -506,7 +508,7 @@ class OptimizersTest(parameterized.TestCase):
     assert np.abs(X[-1, 1]) <= 0.1
 
   def testCustomVJPConsistency(self):
-    vjp_methods = ('explicit', 'cg', 'tvlqr')
+    vjp_methods = ('explicit', 'cg', 'tvlqr', 'tvlqr_experimental')
     vjp_options_per_method = ({}, {'tol': 1e-8}, {})
 
     T = 5
@@ -546,6 +548,95 @@ class OptimizersTest(parameterized.TestCase):
     for dX, dU in jacs[1:]:
       self.assertTrue(pytree_allclose(jacs[0][0], dX, atol=1e-6, rtol=1e-6))
       self.assertTrue(pytree_allclose(jacs[0][1], dU, atol=1e-6, rtol=1e-6))
+
+  @parameterized.named_parameters(
+      ('explicit', 'explicit', {}),
+      ('cg', 'cg', {'tol': 1e-8}),
+      ('tvlqr_experimental', 'tvlqr_experimental', {}))
+  def testGradientOptimization(self, vjp_method, vjp_options):
+    def cost(x, u, t, Q, R):
+      del t
+      return np.dot(x, Q @ x) + np.dot(u, R @ u)
+
+    def dynamics(x, u, t, A, B):
+      del t
+      return A @ x + B @ u
+
+    def random_symmetric_matrix(key, dim, min_eval, max_eval):
+      k1, k2 = jax.random.split(key)
+      W = jax.random.normal(k1, shape=(dim, dim))
+      Q, _ = np.linalg.qr(W)
+      evals = jax.random.uniform(
+          k2, shape=(dim,), minval=min_eval, maxval=max_eval)
+      return Q @ np.diag(evals) @ Q.T
+
+    n, d, T = 5, 3, 10
+
+    Q_true = random_symmetric_matrix(jax.random.PRNGKey(0), n, 1.0, 10.0)
+    R_true = random_symmetric_matrix(jax.random.PRNGKey(1), d, 1.0, 10.0)
+    A_true = jax.random.normal(jax.random.PRNGKey(2), shape=(n, n))
+    B_true = jax.random.normal(jax.random.PRNGKey(3), shape=(n, d))
+    x0_true = jax.random.normal(jax.random.PRNGKey(4), shape=(n,))
+
+    Q_perturb = random_symmetric_matrix(jax.random.PRNGKey(5), n, -0.5, 0.5)
+    R_perturb = random_symmetric_matrix(jax.random.PRNGKey(6), d, -0.5, 0.5)
+    A_perturb = 0.05 * jax.random.normal(jax.random.PRNGKey(7), shape=(n, n))
+    B_perturb = 0.05 * jax.random.normal(jax.random.PRNGKey(8), shape=(n, d))
+    x0_perturb = 0.1 * jax.random.normal(jax.random.PRNGKey(9), shape=(n,))
+
+    @functools.partial(jax.jit, static_argnums=(5,))
+    def make_optimal_traj(A, B, Q, R, x0, T):
+      X, U, _, _, _, _, _ = optimizers.ilqr(
+          functools.partial(cost, Q=Q, R=R),
+          functools.partial(dynamics, A=A, B=B),
+          x0,
+          np.zeros((T, B.shape[1])))
+      return X, U
+    X_true, U_true = make_optimal_traj(
+        A_true, B_true, Q_true, R_true, x0_true, T)
+
+    def loss(A, B, Q, R, x0, X, U):
+      X_ilqr, U_ilqr, _, _, _, _, _ = optimizers.ilqr(
+          functools.partial(cost, Q=Q, R=R),
+          functools.partial(dynamics, A=A, B=B),
+          x0,
+          np.zeros((T, B.shape[1])),
+          vjp_method=vjp_method,
+          vjp_options=vjp_options)
+      return np.sum(np.square(X_ilqr - X)) + np.sum(np.square(U_ilqr - U))
+
+    @functools.partial(jax.jit, static_argnums=(1, 9))
+    def opt_params(param_init, param_index, A_true, B_true, Q_true, R_true,
+                   x0_true, X_true, U_true, num_iters, step_size):
+      assert param_index >= 0 and param_index <= 4
+      grad_param = jax.grad(loss, argnums=param_index)
+      true_params = (A_true, B_true, Q_true, R_true, x0_true, X_true, U_true)
+
+      def get_args(param):
+        return (true_params[:param_index] + (param,) +
+                true_params[param_index + 1:])
+
+      def scan_fn(param, _):
+        param_next = param - step_size * grad_param(*get_args(param))
+        return param_next, loss(*get_args(param_next))
+
+      loss_init = loss(*get_args(param_init))
+      param_final, losses = jax.lax.scan(scan_fn, param_init,
+                                         xs=np.arange(num_iters))
+      return param_final, np.hstack((loss_init, losses))
+
+    params_true = (A_true, B_true, Q_true, R_true, x0_true, X_true, U_true)
+    arguments = (
+        (A_true + A_perturb, 0) + params_true + (5000, 0.001),
+        (B_true + B_perturb, 1) + params_true + (5000, 0.001),
+        (Q_true + Q_perturb, 2) + params_true + (5000, 0.01),
+        (R_true + R_perturb, 3) + params_true + (5000, 0.1),
+        (x0_true + x0_perturb, 4) + params_true + (5000, 0.001),
+    )
+
+    for args in arguments:
+      _, losses = opt_params(*args)
+      self.assertLessEqual(losses[-1], 0.01)
 
   def testCEMUpdateMeanStdev(self):
     num_samples, horizon, dim_control = 400, 20, 1
