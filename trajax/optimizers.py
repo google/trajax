@@ -439,6 +439,7 @@ def ilqr(cost,
          U,
          maxiter=100,
          grad_norm_threshold=1e-4,
+         relative_grad_norm_threshold=0.0,
          make_psd=False,
          psd_delta=0.0,
          alpha_0=1.0,
@@ -465,6 +466,8 @@ def ilqr(cost,
     U: initial_controls - 2D np array of shape (T, m).
     maxiter: maximum iterations.
     grad_norm_threshold: tolerance for stopping optimization.
+    relative_grad_norm_threshold: tolerance on gradient norm for stopping
+      optimization, relative to the gradient norm at the initial guess.
     make_psd: whether to zero negative eigenvalues after quadratization.
     psd_delta: The delta value to make the problem PSD. Specifically, it will
       ensure that d^2c/dx^2 and d^2c/du^2, i.e. the hessian of cost function
@@ -522,25 +525,26 @@ def ilqr(cost,
   if vjp_method == 'explicit':
     return _ilqr_explicit_vjp(new_cost_fn, new_dynamics_fn, x0, U,
                               (tuple(cost_args),), (tuple(dynamics_args),),
-                              maxiter, grad_norm_threshold, make_psd, psd_delta,
+                              maxiter, grad_norm_threshold,
+                              relative_grad_norm_threshold, make_psd, psd_delta,
                               alpha_0, alpha_min, vjp_options)
   elif vjp_method == 'cg':
     return _ilqr_cg_vjp(new_cost_fn, new_dynamics_fn, x0, U,
-                        (tuple(cost_args),), (tuple(dynamics_args),),
-                        maxiter, grad_norm_threshold, make_psd, psd_delta,
-                        alpha_0, alpha_min, vjp_options)
+                        (tuple(cost_args),), (tuple(dynamics_args),), maxiter,
+                        grad_norm_threshold, relative_grad_norm_threshold,
+                        make_psd, psd_delta, alpha_0, alpha_min, vjp_options)
   elif vjp_method == 'tvlqr':
     return _ilqr_tvlqr_vjp(new_cost_fn, new_dynamics_fn, x0, U,
                            (tuple(cost_args),), (tuple(dynamics_args),),
-                           maxiter, grad_norm_threshold, make_psd,
-                           psd_delta, alpha_0, alpha_min, vjp_options)
+                           maxiter, grad_norm_threshold,
+                           relative_grad_norm_threshold, make_psd, psd_delta,
+                           alpha_0, alpha_min, vjp_options)
   elif vjp_method == 'tvlqr_experimental':
-    return _ilqr_tvlqr_experimental_vjp(new_cost_fn, new_dynamics_fn, x0, U,
-                                        (tuple(cost_args),),
-                                        (tuple(dynamics_args),), maxiter,
-                                        grad_norm_threshold, make_psd,
-                                        psd_delta, alpha_0, alpha_min,
-                                        vjp_options)
+    return _ilqr_tvlqr_experimental_vjp(
+        new_cost_fn, new_dynamics_fn, x0, U, (tuple(cost_args),),
+        (tuple(dynamics_args),), maxiter, grad_norm_threshold,
+        relative_grad_norm_threshold, make_psd, psd_delta, alpha_0, alpha_min,
+        vjp_options)
   else:
     raise ValueError(f'vjp_method must be one of {valid_vjp_methods}, '
                      f'got {vjp_method} instead.')
@@ -549,20 +553,22 @@ def ilqr(cost,
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
 @partial(jit, static_argnums=(0, 1))
 def _ilqr_explicit_vjp(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
-                       grad_norm_threshold, make_psd, psd_delta, alpha_0,
-                       alpha_min, vjp_options):
+                       grad_norm_threshold, relative_grad_norm_threshold,
+                       make_psd, psd_delta, alpha_0, alpha_min, vjp_options):
   return _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args,
-                        maxiter, grad_norm_threshold, make_psd, psd_delta,
+                        maxiter, grad_norm_threshold,
+                        relative_grad_norm_threshold, make_psd, psd_delta,
                         alpha_0, alpha_min, vjp_options)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
 @partial(jit, static_argnums=(0, 1))
 def _ilqr_cg_vjp(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
-                 grad_norm_threshold, make_psd, psd_delta, alpha_0,
-                 alpha_min, vjp_options):
+                 grad_norm_threshold, relative_grad_norm_threshold, make_psd,
+                 psd_delta, alpha_0, alpha_min, vjp_options):
   return _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args,
-                        maxiter, grad_norm_threshold, make_psd, psd_delta,
+                        maxiter, grad_norm_threshold,
+                        relative_grad_norm_threshold, make_psd, psd_delta,
                         alpha_0, alpha_min, vjp_options)
 
 
@@ -570,10 +576,11 @@ def _ilqr_cg_vjp(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
 @partial(jit, static_argnums=(0, 1))
 def _ilqr_tvlqr_experimental_vjp(cost, dynamics, x0, U, cost_args,
                                  dynamics_args, maxiter, grad_norm_threshold,
-                                 make_psd, psd_delta, alpha_0, alpha_min,
-                                 vjp_options):
+                                 relative_grad_norm_threshold, make_psd,
+                                 psd_delta, alpha_0, alpha_min, vjp_options):
   return _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args,
-                        maxiter, grad_norm_threshold, make_psd, psd_delta,
+                        maxiter, grad_norm_threshold,
+                        relative_grad_norm_threshold, make_psd, psd_delta,
                         alpha_0, alpha_min, vjp_options)
 
 
@@ -684,11 +691,12 @@ _ilqr_tvlqr_experimental_vjp.defvjp(
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
 @partial(jit, static_argnums=(0, 1))
-def _ilqr_tvlqr_vjp(cost, dynamics, x0, U, cost_args, dynamics_args,
-                    maxiter, grad_norm_threshold, make_psd, psd_delta,
-                    alpha_0, alpha_min, vjp_options):
+def _ilqr_tvlqr_vjp(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
+                    grad_norm_threshold, relative_grad_norm_threshold, make_psd,
+                    psd_delta, alpha_0, alpha_min, vjp_options):
   return _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args,
-                        maxiter, grad_norm_threshold, make_psd, psd_delta,
+                        maxiter, grad_norm_threshold,
+                        relative_grad_norm_threshold, make_psd, psd_delta,
                         alpha_0, alpha_min, vjp_options)
 
 
@@ -731,13 +739,13 @@ _ilqr_tvlqr_vjp.defvjp(_ilqr_tvlqr_fwd, _ilqr_tvlqr_bwd)
 
 
 def _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
-                   grad_norm_threshold, make_psd, psd_delta, alpha_0,
-                   alpha_min, vjp_options):
+                   grad_norm_threshold, relative_grad_norm_threshold, make_psd,
+                   psd_delta, alpha_0, alpha_min, vjp_options):
   """Internal ilqr implementation. Not meant to be called directly."""
 
   del vjp_options
 
-  T, m = U.shape
+  T, _ = U.shape
   n = x0.shape[0]
 
   roll = partial(_rollout, dynamics)
@@ -764,8 +772,14 @@ def _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
 
   c = np.zeros((T, n))  # assumes trajectory is always dynamically feasible.
 
-  gradient = np.full((T, m), np.inf)
-  adjoints = np.zeros((T, n))
+  lqr = get_lqr_params(X, U)
+  _, q, _, r, _, A, B = lqr
+  gradient, adjoints, _ = adjoint(A, B, q, r)
+  grad_norm_initial = np.linalg.norm(gradient)
+  grad_norm_threshold = np.maximum(
+      grad_norm_threshold,
+      relative_grad_norm_threshold *
+      np.where(np.isnan(grad_norm_initial), 1.0, grad_norm_initial + 1.0))
 
   def body(inputs):
     """Solves LQR subproblem and returns updated trajectory."""
@@ -795,7 +809,6 @@ def _ilqr_template(cost, dynamics, x0, U, cost_args, dynamics_args, maxiter,
         iteration < maxiter,
         np.logical_and(grad_norm > grad_norm_threshold, alpha > alpha_min))
 
-  lqr = get_lqr_params(X, U)
   X, U, obj, _, gradient, adjoints, lqr, it = lax.while_loop(
       continuation_criterion, body,
       (X, U, obj, alpha_0, gradient, adjoints, lqr, 0))
@@ -1116,23 +1129,23 @@ def random_shooting(cost,
 
 
 @partial(jit, static_argnums=(0, 1, 4, 5, 12,))
-def constrained_ilqr(
-    cost,
-    dynamics,
-    x0,
-    U,
-    equality_constraint=lambda x, u, t: np.empty(1),
-    inequality_constraint=lambda x, u, t: np.empty(1),
-    maxiter_al=5,
-    maxiter_ilqr=100,
-    grad_norm_threshold=1.0e-4,
-    constraints_threshold=1.0e-2,
-    penalty_init=1.0,
-    penalty_update_rate=10.0,
-    make_psd=True,
-    psd_delta=0.0,
-    alpha_0=1.0,
-    alpha_min=0.00005):
+def constrained_ilqr(cost,
+                     dynamics,
+                     x0,
+                     U,
+                     equality_constraint=lambda x, u, t: np.empty(1),
+                     inequality_constraint=lambda x, u, t: np.empty(1),
+                     maxiter_al=5,
+                     maxiter_ilqr=100,
+                     grad_norm_threshold=1.0e-4,
+                     relative_grad_norm_threshold=0.0,
+                     constraints_threshold=1.0e-2,
+                     penalty_init=1.0,
+                     penalty_update_rate=10.0,
+                     make_psd=True,
+                     psd_delta=0.0,
+                     alpha_0=1.0,
+                     alpha_min=0.00005):
   """Constrained Iterative Linear Quadratic Regulator.
 
   Args:
@@ -1151,6 +1164,9 @@ def constrained_ilqr(
       penalty updates.
     maxiter_ilqr: maximum iterations for iLQR.
     grad_norm_threshold: tolerance for stopping iLQR optimization
+      before augmented Lagrangian update.
+    relative_grad_norm_threshold: tolerance on gradient norm for stopping
+      optimization, relative to the gradient norm at the initial guess,
       before augmented Lagrangian update.
     constraints_threshold: tolerance for constraint violation (infinity norm).
     penalty_init: initial penalty value.
@@ -1256,6 +1272,7 @@ def constrained_ilqr(
         x0,
         U,
         grad_norm_threshold=grad_norm_threshold,
+        relative_grad_norm_threshold=relative_grad_norm_threshold,
         make_psd=make_psd,
         psd_delta=psd_delta,
         alpha_0=alpha_0,
