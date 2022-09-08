@@ -34,9 +34,7 @@ from functools import partial  # pylint: disable=g-importing-member
 
 from jax import jit
 from jax import lax
-from jax import ops
 import jax.numpy as np
-import jax.scipy as sp
 
 
 @jit
@@ -87,16 +85,16 @@ def lqr_step(P, p, Q, q, R, r, M, A, B, c, delta=1e-8):
   BtP = np.matmul(B.T, P)
   BtPA = np.matmul(BtP, A)
 
-  G = symmetrize(R + np.matmul(BtP, B))
-  # make G positive definite so that smallest eigenvalue > delta.
-  S, _ = np.linalg.eigh(G)
-  G_ = G + np.maximum(0.0, delta - S[0]) * np.eye(G.shape[0])
-
   H = BtPA + M.T
   h = np.matmul(B.T, p) + np.matmul(BtP, c) + r
 
-  K = -sp.linalg.solve(G_, H, sym_pos=True)
-  k = -sp.linalg.solve(G_, h, sym_pos=True)
+  G = symmetrize(R + np.matmul(BtP, B))
+
+  # Get damped (Levenberg-Marquardt) inverse.
+  K_k, *_ = np.linalg.lstsq(
+      G, -np.hstack((H, np.reshape(h, (-1, 1)))), rcond=delta)
+  K, k = np.hsplit(K_k, [K_k.shape[1] - 1])
+  k = k.flatten()
 
   H_GK = H + np.matmul(G, K)
   P = symmetrize(Q + AtPA + np.matmul(H_GK.T, K) + np.matmul(K.T, H))
