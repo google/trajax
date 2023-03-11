@@ -55,9 +55,9 @@ def cartpole(state, action, timestep, params=(10.0, 1.0, 0.5)):
 
   CqdG = jnp.dot(C, jnp.expand_dims(qd, 1)) + G
   f = jnp.concatenate(
-      (qd, jnp.squeeze(-jsp.linalg.solve(H, CqdG, sym_pos=True))))
+      (qd, jnp.squeeze(-jsp.linalg.solve(H, CqdG, assume_a='pos'))))
 
-  v = jnp.squeeze(jsp.linalg.solve(H, B, sym_pos=True))
+  v = jnp.squeeze(jsp.linalg.solve(H, B, assume_a='pos'))
   g = jnp.concatenate((jnp.zeros(2), v))
   xdot = f + g * action
 

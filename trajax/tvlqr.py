@@ -95,8 +95,8 @@ def lqr_step(P, p, Q, q, R, r, M, A, B, c, delta=1e-8):
   H = BtPA + M.T
   h = np.matmul(B.T, p) + np.matmul(BtP, c) + r
 
-  K = -sp.linalg.solve(G_, H, sym_pos=True)
-  k = -sp.linalg.solve(G_, h, sym_pos=True)
+  K = -sp.linalg.solve(G_, H, assume_a='pos')
+  k = -sp.linalg.solve(G_, h, assume_a='pos')
 
   H_GK = H + np.matmul(G, K)
   P = symmetrize(Q + AtPA + np.matmul(H_GK.T, K) + np.matmul(K.T, H))
