@@ -607,10 +607,10 @@ def vhp_params(cost):
       Cx = hessian_x_params(X[t], U[t], t, *args)
       Cu = hessian_u_params(X[t], U[t], t, *args)
       w = np.matmul(B[t], vector[t])
-      g = jax.tree_multimap(
+      g = jax.tree_map(
           lambda P_, g_, Cu_: g_ + contract(vector[t], Cu_) + contract(w, P_),
           P, g, Cu)
-      P = jax.tree_multimap(lambda P_, Cx_: contract(A[t].T, P_) + Cx_, P, Cx)
+      P = jax.tree_map(lambda P_, Cx_: contract(A[t].T, P_) + Cx_, P, Cx)
       return P, g
 
     return lax.fori_loop(0, T, body, (Cx, gradient))
