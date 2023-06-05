@@ -655,9 +655,10 @@ class OptimizersTest(parameterized.TestCase):
     })
     updated_mean, updated_stdev = optimizers.cem_update_mean_stdev(
         old_mean, old_stdev, sampled_controls, costs, hyperparams)
-    self.assertEqual(updated_mean.all(), np.ones((horizon, dim_control)).all())
-    self.assertEqual(updated_stdev.all(),
-                     np.zeros((horizon, dim_control)).all())
+    self.assertEqual(updated_mean.shape, (horizon, dim_control))
+    self.assertEqual(updated_stdev.shape, (horizon, dim_control))
+    self.assertTrue(np.allclose(updated_mean, np.ones_like(updated_mean)))
+    self.assertTrue(np.allclose(updated_stdev, np.zeros_like(updated_stdev)))
 
   def testConstrainedAcrobotSolve(self):
     T = 50
