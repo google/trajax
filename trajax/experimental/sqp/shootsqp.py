@@ -177,6 +177,7 @@ class ShootSQP(solver_base.TrajectoryOptimizationSolver):
         ls_alpha_lb=1e-5,  # lower-bound for step-size; range: (1e-6, 1e-4).
         primal_tol=1e-3,  # primal convergence tolerance; range: (1e-4, 1e-1).
         dual_tol=1e-3,  # dual convergence tolerance; range: (1e-4, 1e-1).
+        stall_check="rel",  # stall checking; either 'abs' or 'rel'.
         ddp_options={},  # options for sensitivity gain computation.
         max_iter=100)  # maximum number of SQP iterations.
     opt.update(user_options)
@@ -235,7 +236,6 @@ class ShootSQP(solver_base.TrajectoryOptimizationSolver):
 
     max_iter = self.opt.max_iter
     verbose = self.opt.verbose
-    primal_tol = self.opt.primal_tol
     do_log = self.opt.do_log
 
     # Initialize X0.
@@ -311,7 +311,7 @@ class ShootSQP(solver_base.TrajectoryOptimizationSolver):
         obj = kkt_resid["obj"]
         print(f"SOLVE: it: {self.it}, obj: {obj}, |dU|: {step_size}, "
               f"step-length: {alpha}, rho: {jnp.max(Rho)}")
-      if step_size < primal_tol * (1 + jnp.linalg.norm(primals[0], "fro")):
+      if self._is_stalled(step_size, primals):
         status = Status.STALLED
       elif self.it >= max_iter:
         status = Status.MAXITER
@@ -644,3 +644,13 @@ class ShootSQP(solver_base.TrajectoryOptimizationSolver):
     if ddp_errs:
       history["ddp_err"].append(ddp_errs[0])
       history["ddp_err_grad"].append(ddp_errs[1])
+
+  def _is_stalled(self, step_size: float, primals) -> bool:
+    """Check for optimization stalling."""
+    primal_tol = self.opt.primal_tol
+    stall_check = self.opt.stall_check
+    if stall_check == "rel":
+      return step_size < primal_tol * (1 + jnp.linalg.norm(primals[0], "fro"))
+    else:
+      assert stall_check == "abs"
+      return step_size < primal_tol
