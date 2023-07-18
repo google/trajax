@@ -50,6 +50,7 @@ from __future__ import print_function
 from functools import partial  # pylint: disable=g-importing-member
 
 import jax
+from frozendict import frozendict
 from jax import custom_derivatives
 from jax import device_get
 from jax import hessian
@@ -985,13 +986,13 @@ def scipy_minimize(cost,
 
 
 def default_cem_hyperparams():
-  return {
+  return frozendict({
       'sampling_smoothing': 0.,
       'evolution_smoothing': 0.1,
       'elite_portion': 0.1,
       'max_iter': 10,
       'num_samples': 400
-  }
+  })
 
 
 @partial(jit, static_argnums=(4,))
@@ -1116,7 +1117,7 @@ def cem(cost,
   return X, mean, obj
 
 
-@partial(jit, static_argnums=(0, 1))
+@partial(jit, static_argnums=(0, 1, 6, 7))
 def random_shooting(cost,
                     dynamics,
                     init_state,
@@ -1160,7 +1161,7 @@ def random_shooting(cost,
   obj_fn = partial(_objective, cost, dynamics)
   controls = gaussian_samples(random_key, mean, stdev, control_low,
                               control_high, hyperparams)
-  costs = vmap(obj_fn, in_axes=(0, None))(controls, init_state)
+  costs = vmap(obj_fn, in_axes=(0, None, None, None))(controls, init_state, {}, {})
   best_idx = np.argmin(costs)
 
   U = controls[best_idx]
