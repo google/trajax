@@ -818,6 +818,101 @@ class OptimizersTest(parameterized.TestCase):
     self.assertLess(
         np.linalg.norm(X[-1] - goal, ord=np.inf), constraints_threshold)
 
+  def testRandomShooting1(self):
+    """
+    test_CEM1
+    Description:
+        Attempts to use the Cross Entropy Method to solve the acrobot problem from "testAcrobotSolve"
+    """
+
+    T = 50
+    goal = np.array([np.pi, 0.0, 0.0, 0.0])
+    dynamics = euler(acrobot, dt=0.1)
+
+    def cost(x, u, t, params):
+      delta = x - goal
+      terminal_cost = 0.5 * params[0] * np.dot(delta, delta)
+      stagewise_cost = 0.5 * params[1] * np.dot(
+          delta, delta) + 0.5 * params[2] * np.dot(u, u)
+      return np.where(t == T, terminal_cost, stagewise_cost)
+
+    x0 = np.zeros(4)
+    U = np.zeros((T, 1))
+    params = np.array([1000.0, 0.1, 0.01])
+    zero_input_obj = 4959.476212
+    self.assertLess(
+        np.abs(
+            optimizers.objective(
+                functools.partial(cost, params=params), dynamics, U, x0) -
+            zero_input_obj), 1e-6)
+
+    optimal_obj = 51.0
+    cem_hyperparams = frozendict({
+        'sampling_smoothing': 0.2,
+        'evolution_smoothing': 0.1,
+        'elite_portion': 0.1,
+        'max_iter': 100,
+        'num_samples': 20_000
+    })
+    X_opt, U_opt, obj = optimizers.random_shooting(
+        functools.partial(cost, params=params),
+        dynamics,
+        x0,
+        U,
+        np.array([-5.0]), np.array([5.0]),
+        hyperparams=cem_hyperparams,
+    )
+    self.assertLessEqual(obj, zero_input_obj)
+    self.assertLessEqual(obj, 10*optimal_obj)
+    # Approximately 234
+
+  def testCEM1(self):
+    """
+    test_CEM1
+    Description:
+      Attempts to use the Cross Entropy Method to solve the acrobot problem from "testAcrobotSolve"
+    """
+
+    T = 50
+    goal = np.array([np.pi, 0.0, 0.0, 0.0])
+    dynamics = euler(acrobot, dt=0.1)
+
+    def cost(x, u, t, params):
+        delta = x - goal
+        terminal_cost = 0.5 * params[0] * np.dot(delta, delta)
+        stagewise_cost = 0.5 * params[1] * np.dot(
+            delta, delta) + 0.5 * params[2] * np.dot(u, u)
+        return np.where(t == T, terminal_cost, stagewise_cost)
+
+    x0 = np.zeros(4)
+    U = np.zeros((T, 1))
+    params = np.array([1000.0, 0.1, 0.01])
+    zero_input_obj = 4959.476212
+    self.assertLess(
+        np.abs(
+            optimizers.objective(
+                functools.partial(cost, params=params), dynamics, U, x0) -
+            zero_input_obj), 1e-6)
+
+    optimal_obj = 51.0
+    cem_hyperparams = frozendict({
+        'sampling_smoothing': 0.2,
+        'evolution_smoothing': 0.1,
+        'elite_portion': 0.1,
+        'max_iter': 100,
+        'num_samples': 20_000
+    })
+    X_opt, U_opt, obj = optimizers.cem(
+        functools.partial(cost, params=params),
+        dynamics,
+        x0,
+        U,
+        np.array([-5.0]), np.array([5.0]),
+        hyperparams=cem_hyperparams,
+    )
+    self.assertLessEqual(obj, zero_input_obj)
+    self.assertLessEqual(obj, 10*optimal_obj)
+    # Objective is Around 171
 
 if __name__ == '__main__':
   absltest.main()
