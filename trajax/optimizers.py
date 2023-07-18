@@ -1052,7 +1052,7 @@ def gaussian_samples(random_key, mean, stdev, control_low, control_high,
   return samples
 
 
-@partial(jit, static_argnums=(0, 1))
+@partial(jit, static_argnums=(0, 1, 6, 7))
 def cem(cost,
         dynamics,
         init_state,
@@ -1165,8 +1165,8 @@ def random_shooting(cost,
   best_idx = np.argmin(costs)
 
   U = controls[best_idx]
-  X = rollout(dynamics, mean, init_state)
-  obj = objective(cost, dynamics, mean, init_state)
+  X = rollout(dynamics, U, init_state)
+  obj = objective(cost, dynamics, U, init_state)
   return X, U, obj
 
 
