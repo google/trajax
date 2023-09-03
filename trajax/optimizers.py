@@ -48,6 +48,7 @@ from __future__ import division
 from __future__ import print_function
 
 from functools import partial  # pylint: disable=g-importing-member
+from frozendict import frozendict
 
 import jax
 from jax import custom_derivatives
@@ -985,13 +986,13 @@ def scipy_minimize(cost,
 
 
 def default_cem_hyperparams():
-  return {
+  return frozendict({
       'sampling_smoothing': 0.,
       'evolution_smoothing': 0.1,
       'elite_portion': 0.1,
       'max_iter': 10,
       'num_samples': 400
-  }
+  })
 
 
 @partial(jit, static_argnums=(4,))
@@ -1051,7 +1052,7 @@ def gaussian_samples(random_key, mean, stdev, control_low, control_high,
   return samples
 
 
-@partial(jit, static_argnums=(0, 1))
+@partial(jit, static_argnums=(0, 1, 6, 7))
 def cem(cost,
         dynamics,
         init_state,
@@ -1108,7 +1109,7 @@ def cem(cost,
     return mean, stdev, random_key
 
   # TODO(sindhwani): swap with lax.scan to make this optimizer differentiable.
-  mean, stdev, random_key = lax.fori_loop(0, hyperparams['max_iter'], loop_body,
+  mean, stdev, random_key = lax.fori_loop(0, hyperparams["max_iter"], loop_body,
                                           (mean, stdev, random_key))
 
   X = rollout(dynamics, mean, init_state)
@@ -1116,7 +1117,129 @@ def cem(cost,
   return X, mean, obj
 
 
-@partial(jit, static_argnums=(0, 1))
+
+# Sampling based Zeroth Order Optimization via Model Predictive Path Integral (MPPI)
+
+def default_mppi_hyperparams():
+  return frozendict({
+      'noise_stdev': 0.,
+      'lambda': 0.1,
+      'max_iter': 10,
+      'num_samples': 400
+  })
+
+
+@partial(jit, static_argnums=(2,))
+def noise_samples(random_key, controls, hyperparams):
+  """Samples a batch of noise sequences based on Gaussian distribution.
+
+  Args:
+    random_key: a jax.random.PRNGKey() random seed
+    controls: control sequence, has dimension (horizion, dim_control).
+    hyperparams: dictionary of hyperparameters with following keys:
+        num_samples-- number of noise sequences to sample
+
+  Returns:
+    Array of sampled controls, with dimension (num_samples, horizon,
+    dim_control).
+  """
+  num_samples = hyperparams['num_samples']
+  horizon = controls.shape[0]
+  dim_control = controls.shape[1]
+  noises = jax.random.normal(random_key, shape=(num_samples, horizon, dim_control))
+  return noises
+
+
+@partial(jit, static_argnums=(3,))
+def mppi_update(old_controls, noise_seq, costs, hyperparams):
+    lam = hyperparams['lambda']
+
+    # importance sampling
+    beta = np.min(costs)
+    eta = np.sum(np.exp(- 1. / lam * (costs - beta)), axis=0) + 1e-10  # numerical stability
+    weights = np.exp(- 1. / lam * (costs - beta)) / eta
+
+    # update inputs
+    controls = old_controls + np.sum(weights[:, np.newaxis, np.newaxis] * noise_seq, axis=0)
+    return controls
+
+
+@jit
+def clip_controls(controls, control_low, control_high):
+    control_low = jax.lax.broadcast(control_low, controls.shape[:-1])
+    control_high = jax.lax.broadcast(control_high, controls.shape[:-1])
+    controls = np.clip(controls, control_low, control_high)
+    return controls
+
+
+@partial(jit, static_argnums=(0, 1, 6, 7))
+def mppi(cost,
+        dynamics,
+        init_state,
+        init_controls,
+        control_low,
+        control_high,
+        random_key=None,
+        hyperparams=None):
+  """Model Predictive Path Integral (MPPI) Control.
+
+  MPPI is a sampling-based optimization algorithm. At each iteration, MPPI samples
+  a batch of Gaussian noise sequences and perturbs actions with it. It then uses
+  importance sampling to weight control inputs based on their cost and compute the
+  actions, which are used as initial solution in the next iteration.
+
+  The implementation follows Algorithm 2 in https://ieeexplore.ieee.org/document/7989202
+  allowing also for approximate models s.a. neural network dynamic models.
+
+  Args:
+    cost: cost(x, u, t) returns a scalar
+    dynamics: dynamics(x, u, t) returns next state
+    init_state: initial state
+    init_controls: initial controls, of the shape (horizon, dim_control)
+    control_low: lower bound of control space
+    control_high: upper bound of control space
+    random_key: jax.random.PRNGKey() that serves as a random seed
+    hyperparams: a dictionary of algorithm hyperparameters with following keys
+      noise_stdev -- standard deviation of the zero mean Gaussian from which the noise sequence is sampled.
+      lambda -- temperature parameter in MPPI defining the free energy of the control system
+      max_iter -- maximum number of iterations
+      num_samples -- number of action sequences
+
+  Returns:
+    X: Optimal state trajectory.
+    U: Optimized control sequence, an array of shape (horizon, dim_control)
+    obj: scalar objective achieved.
+  """
+  if random_key is None:
+    random_key = random.PRNGKey(0)
+  if hyperparams is None:
+    hyperparams = default_mppi_hyperparams()
+  U0 = np.array(init_controls)
+  obj_fn = partial(objective, cost, dynamics)
+
+  def body_fn(carry, iter_num):
+    initial_controls, random_key = carry
+    random_key, rng = random.split(random_key)
+
+    # get random noise sequence and evaluate costs
+    noise_seq = noise_samples(rng, initial_controls, hyperparams)
+    batch_controls = clip_controls(initial_controls + noise_seq, control_low, control_high)
+    costs = vmap(obj_fn, in_axes=(0, None))(batch_controls, init_state)
+
+    # update the solution using MPPI
+    updated_controls = mppi_update(initial_controls, noise_seq, costs, hyperparams)
+    updated_controls = clip_controls(updated_controls, control_low, control_high)
+    return (updated_controls, random_key), None
+
+  (controls, random_key), _ = lax.scan(body_fn, (U0, random_key), np.arange(hyperparams['max_iter']))
+
+  X = rollout(dynamics, controls, init_state)
+  obj = objective(cost, dynamics, controls, init_state)
+  return X, controls, obj
+
+
+
+@partial(jit, static_argnums=(0, 1, 6, 7))
 def random_shooting(cost,
                     dynamics,
                     init_state,
@@ -1164,8 +1287,8 @@ def random_shooting(cost,
   best_idx = np.argmin(costs)
 
   U = controls[best_idx]
-  X = rollout(dynamics, mean, init_state)
-  obj = objective(cost, dynamics, mean, init_state)
+  X = rollout(dynamics, U, init_state)
+  obj = objective(cost, dynamics, U, init_state)
   return X, U, obj
 
 
